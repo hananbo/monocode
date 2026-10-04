@@ -1765,7 +1765,7 @@ describe("Composer question focus", () => {
       window.removeEventListener("monocode:open-mcp-settings", onOpen);
     }
   });
-  it.each(["rapid", "started", "switched"])(
+  it.each(["rapid", "started", "switched", "mode-changed"])(
     "rechecks draft state after a pending isolation shortcut (%s)",
     async (scenario) => {
       const onWorkspaceModeChange = vi.fn();
@@ -1824,6 +1824,12 @@ describe("Composer question focus", () => {
         await act(async () =>
           root.render(
             createElement(Composer, { ...props, sessionId: "another-draft" }),
+          ),
+        );
+      if (scenario === "mode-changed")
+        await act(async () =>
+          root.render(
+            createElement(Composer, { ...props, workspaceMode: "cow" }),
           ),
         );
       await act(async () =>

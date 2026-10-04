@@ -639,10 +639,26 @@ export function Composer({
     enabled,
     busy,
     workspaceMode,
+    committedWorkspaceMode: workspaceMode,
     resolvedWorktreeBase,
     onWorkspaceModeChange,
   });
-  workspaceShortcutRef.current = {
+  useLayoutEffect(() => {
+    workspaceShortcutRef.current = {
+      sessionId,
+      cwd,
+      executionCwd,
+      draftResetToken,
+      draftWorkspace,
+      disabled,
+      enabled,
+      busy,
+      workspaceMode,
+      committedWorkspaceMode: workspaceMode,
+      resolvedWorktreeBase,
+      onWorkspaceModeChange,
+    };
+  }, [
     sessionId,
     cwd,
     executionCwd,
@@ -654,7 +670,7 @@ export function Composer({
     workspaceMode,
     resolvedWorktreeBase,
     onWorkspaceModeChange,
-  };
+  ]);
   const [hasValue, setHasValue] = useState(
     () =>
       (initialDraft ?? "").trim().length > 0 ||
@@ -1901,6 +1917,7 @@ export function Composer({
           latest.cwd !== captured.cwd ||
           latest.executionCwd !== captured.executionCwd ||
           latest.draftResetToken !== captured.draftResetToken ||
+          latest.committedWorkspaceMode !== captured.committedWorkspaceMode ||
           !latest.draftWorkspace ||
           !latest.onWorkspaceModeChange ||
           latest.disabled ||
@@ -1916,8 +1933,10 @@ export function Composer({
         ];
         const next =
           modes[
-            (modes.indexOf(latest.workspaceMode ?? "current") + 1) % modes.length
+            (modes.indexOf(latest.workspaceMode ?? "current") + 1) %
+              modes.length
           ];
+        // Advance rapid shortcuts without changing the committed-mode guard.
         workspaceShortcutRef.current = { ...latest, workspaceMode: next };
         latest.onWorkspaceModeChange(
           next,
