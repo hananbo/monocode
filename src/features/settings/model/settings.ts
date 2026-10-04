@@ -163,12 +163,7 @@ export type SettingsEntry = {
 };
 
 export const SETTINGS_INDEX: SettingsEntry[] = [
-  {
-    id: "remote-machines",
-    section: "connections",
-    label: "Your machines",
-    keywords: "ssh remote connect host server environment",
-  },
+  { id: "remote-machines", section: "connections", label: "Your machines", keywords: "ssh remote connect host server environment" },
   {
     id: "mcp-servers",
     section: "mcp",
@@ -1143,7 +1138,9 @@ function defaultShortcutsFor(command: string): string[] {
     return value ? [value] : [];
   };
   if (row.keys.includes("…")) {
-    return [1, 2, 3, 4, 5, 6, 7, 8].flatMap((digit) => chords(`Digit${digit}`));
+    return [1, 2, 3, 4, 5, 6, 7, 8].flatMap((digit) =>
+      chords(`Digit${digit}`),
+    );
   }
   if (/^[A-Za-z]$/.test(rest)) return chords(`Key${rest.toUpperCase()}`);
   if (/^[0-9]$/.test(rest)) return chords(`Digit${rest}`);
@@ -1163,7 +1160,9 @@ function shortcutOwners(): Map<string, string> {
         : defaultShortcutsFor(row.command);
     for (const chord of chords) owners.set(chord, row.command);
   }
-  for (const [command, override] of Object.entries(loadKeybindingOverrides())) {
+  for (const [command, override] of Object.entries(
+    loadKeybindingOverrides(),
+  )) {
     if (override.shortcut) owners.set(override.shortcut, command);
   }
   return owners;

@@ -15,7 +15,8 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeLocal }));
 import { runRemoteCommand } from "./remoteCommands";
 import { parseRemotePath, remotePath } from "./remoteProjects";
 import { listDir, readBinaryFile, readTextFile, statFiles, writeTextFile } from "../../../platform/tauri/fs";
-import { checkCowRemoval } from "../../source-control/model/cow";
+import { checkCowRemoval, cowCapability, listCowWorkspaces } from "../../source-control/model/cow";
+import { listWorktrees } from "../../source-control/model/worktrees";
 
 beforeEach(() => {
   remoteRequest.mockReset();
@@ -58,6 +59,39 @@ it("relays CoW cleanup preflight to the owning host", async () => {
   });
   expect(invokeLocal).not.toHaveBeenCalled();
 });
+
+it("keeps worktree discovery usable when an older host has no CoW commands", async () => {
+  remoteRequest.mockRejectedValueOnce(new Error("Host rejected request: Unsupported workspace command"));
+  expect(await listCowWorkspaces("remote://env/home/me/repo")).toEqual([]);
+  remoteRequest.mockResolvedValueOnce({
+    defaultRoot: "/home/me/repo-worktrees",
+    worktrees: [{ path: "/home/me/repo-worktrees/feature", branch: "feature" }],
+  });
+  expect(await listWorktrees("remote://env/home/me/repo")).toMatchObject({
+    defaultRoot: "remote://env/home/me/repo-worktrees",
+    worktrees: [{ path: "remote://env/home/me/repo-worktrees/feature", branch: "feature" }],
+  });
+  expect(invokeLocal).not.toHaveBeenCalled();
+});
+
+it("explains unavailable CoW on older hosts and refuses cleanup mutations", async () => {
+  remoteRequest.mockRejectedValue(new Error("Unsupported workspace command"));
+  expect(await cowCapability("remote://env/home/me/repo")).toMatchObject({
+    supported: false,
+    reason: expect.stringContaining("Update MonoCode Host"),
+  });
+  await expect(checkCowRemoval("remote://env/home/me/repo", "owned-copy", true))
+    .rejects.toThrow("Update MonoCode Host");
+});
+
+it.each(["Host disconnected", "Host rejected request: Isolation root was replaced"])(
+  "preserves real CoW discovery failures: %s",
+  async (message) => {
+    remoteRequest.mockRejectedValue(new Error(message));
+    await expect(listCowWorkspaces("remote://env/home/me/repo")).rejects.toThrow(message);
+    await expect(cowCapability("remote://env/home/me/repo")).rejects.toThrow(message);
+  },
+);
 
 it("maps path results back and leaves file contents alone", async () => {
   remoteRequest.mockResolvedValueOnce("remote://not-a-path");

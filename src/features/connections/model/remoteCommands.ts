@@ -64,6 +64,8 @@ const ENTRY_RESULTS = new Set(["list_dir", "list_project_files", "stat_files"]);
 const UNAVAILABLE = "This isn’t available for projects on another machine yet.";
 const OUTDATED =
   "Update MonoCode Host in Connections settings to use this project’s files.";
+const COW_OUTDATED =
+  "Update MonoCode Host in Connections settings to use copy-on-write isolation on APFS.";
 
 /** Runs a file command whose paths are `remote://` paths on the machine that
  * owns them, translating paths both ways so callers never see host paths. */
@@ -106,8 +108,15 @@ export async function runRemoteCommand(
       args: hostArgs,
     });
   } catch (reason) {
-    if (/Unsupported (host method|remote operation)/i.test(String(reason)))
+    if (/Unsupported (host method|remote operation|workspace command)/i.test(String(reason))) {
+      // Old hosts still support ordinary projects and worktrees. Optional CoW
+      // discovery must not prevent those existing flows from loading.
+      if (command === "cow_list") return [];
+      if (command === "cow_capability")
+        return { supported: false, reason: COW_OUTDATED };
+      if (command.startsWith("cow_")) throw new Error(COW_OUTDATED);
       throw new Error(OUTDATED);
+    }
     throw reason;
   }
   const fromHost = (path: string) => remotePath(env, path);
