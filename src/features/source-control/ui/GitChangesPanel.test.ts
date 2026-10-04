@@ -58,8 +58,6 @@ import {
   gitPull,
   gitPush,
   gitRangeContext,
-  gitStageFile,
-  gitUnstageFile,
   notifyGitChanged,
 } from "../../../platform/tauri/fs";
 import {
@@ -244,7 +242,13 @@ async function showTree() {
 }
 
 describe("GitChangesPanel folder actions", () => {
-  it.each(["/repo", "remote://machine/home/user/repo"])(
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it.each(["/repo", "/repo-cow/session", "remote://machine/home/user/repo"])(
     "stages a collapsed folder in one operation for %s",
     async (cwd) => {
       const files = [
