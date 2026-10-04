@@ -90,3 +90,29 @@ it("keeps ordinary launches compatible and rejects conflicting workspace fields"
   ])
     expect(parseQuickLaunch({ ...base, ...fields })).toBeNull();
 });
+
+it("checks native CoW support and defers creation through launch/session parsing", async () => {
+  vi.mocked(invoke).mockResolvedValue({ supported: true });
+  const fields = await quickWorkspaceLaunch({ cwd: base.cwd, mode: "cow" });
+  expect(invoke).toHaveBeenCalledWith("cow_capability", { cwd: base.cwd });
+  expect(fields).toEqual({ workspaceMode: "cow", worktreeBase: "HEAD" });
+  const launch = parseQuickLaunch({ ...base, ...fields })!;
+  expect(
+    applyQuickWorkspace(newSession("codex", base.cwd), launch).workspaceMode,
+  ).toBe("cow");
+  expect(
+    parseQuickLaunch({ ...base, workspaceMode: "cow", worktreeBase: "main" })?.worktreeBase,
+  ).toBe("main");
+  expect(
+    parseQuickLaunch({ ...base, workspaceMode: "cow", worktreeCwd: tree.path }),
+  ).toBeNull();
+});
+it("blocks unavailable CoW instead of silently switching isolation", async () => {
+  vi.mocked(invoke).mockResolvedValue({
+    supported: false,
+    reason: "Unsupported filesystem",
+  });
+  await expect(
+    quickWorkspaceLaunch({ cwd: base.cwd, mode: "cow" }),
+  ).rejects.toThrow("Unsupported filesystem");
+});

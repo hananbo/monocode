@@ -1458,6 +1458,19 @@ describe("Composer question focus", () => {
     ).not.toBeNull();
   });
 
+  it("identifies a started copy-on-write session separately from a worktree", async () => {
+    await act(async () => root.render(createElement(Composer, {
+      focused: true, harness: "claude", model: "claude-sonnet", runtimeMode: "supervised",
+      cwd: "/repo", executionCwd: "/repo-cow/session", cowId: "cow-session",
+      hideProjectPicker: true, onFocus: vi.fn(), onCwdChange: vi.fn(),
+      onWorktreeChange: vi.fn(async () => {}), onModelChange: vi.fn(),
+      onRuntimeModeChange: vi.fn(), onSubmit: vi.fn(),
+    })));
+    expect(container.querySelector('[aria-label="Workspace Copy-on-write"]')?.tagName).toBe("DIV");
+    expect(container.querySelector('[aria-label="Workspace Worktree"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Branch mc/greeting"]')?.textContent).toContain("Copy-on-write");
+  });
+
   it("toggles a draft between the current checkout and a new worktree", async () => {
     const onWorkspaceModeChange = vi.fn();
     const onWorktreeBaseChange = vi.fn();

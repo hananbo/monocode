@@ -1,3 +1,5 @@
+import type { ControlOutcome } from "../../orchestration/model/orchestration";
+import { loadDefaultIsolationMode } from "../../settings/model/settings";
 import { dropContextWindow, type ContextUsage } from "./contextUsage";
 import type { UserQuestionPrompt } from "./userQuestion";
 import type { HandoffComposerCard } from "./handoff";
@@ -78,6 +80,8 @@ export type EditedResendRejection = {
   providerRewound: boolean;
 };
 export type ComposerTurnOptions = {
+  /** Internal submissions wait for the provider's final settled result. */
+  onSettled?: (outcome: ControlOutcome) => void;
   intent?: TurnIntent;
   resendEdited?: boolean;
   /** Restore an edited prompt when the resend rejects asynchronously. */
@@ -389,7 +393,7 @@ export const RUNTIME_MODE_HINT: Record<RuntimeMode, string> = {
     "Allow commands, edits, and supported MCP confirmations in non-plan turns without prompts.",
 };
 
-export type WorkspaceMode = "current" | "worktree";
+export type WorkspaceMode = "current" | "worktree" | "cow";
 
 export type Session = {
   /** Receipt for an acknowledged floating-composer handoff. */
@@ -437,6 +441,9 @@ export type Session = {
   branch?: string;
   /** Selected working copy; cwd remains the project identity. */
   worktreeCwd?: string;
+  cowId?: string;
+  /** Source checkout for an independently isolated child conversation. */
+  cowSourceCwd?: string;
   /** Blank-composer choice; consumed when the first turn starts. */
   workspaceMode?: WorkspaceMode;
   /** Base ref for a worktree that will be created on first send. */
@@ -513,6 +520,7 @@ export function newSession(
   modelSettings?: Record<string, string>,
 ): Session {
   const resolved = resolveModel(harness, model ?? preferredModelId(harness));
+  const isolation = loadDefaultIsolationMode();
   return {
     id: crypto.randomUUID(),
     harness,
@@ -522,6 +530,8 @@ export function newSession(
     title: HARNESS_LABEL[harness],
     cwd,
     blocks: [],
+    ...(isolation === "current" ? {} : { workspaceMode: isolation }),
+    ...(isolation !== "current" ? { worktreeBase: "HEAD" } : {}),
   };
 }
 

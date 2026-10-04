@@ -3,6 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { basename, isAbsolute } from "node:path";
 import { renameHostWorktreeBranch, resolveHostWorktree } from "./git-worktrees";
+import { ownedHostCow, resolveHostWorkspace } from "./cow";
 import {
   applyHarnessEvent,
   stopStreaming,
@@ -99,6 +100,7 @@ export function parseCommand(input: unknown): HostCommand {
       ...(v.worktreeCwd !== undefined
         ? { worktreeCwd: text(v.worktreeCwd, "working copy", 4096) }
         : {}),
+      ...(v.cowId !== undefined ? { cowId: text(v.cowId, "copy-on-write ID") } : {}),
       ...(v.autoWorktreeBranch !== undefined
         ? { autoWorktreeBranch: v.autoWorktreeBranch as string }
         : {}),
@@ -429,7 +431,14 @@ export class HostEngine {
         if (this.switchingProjects.has(project.id))
           throw new Error("Wait for the branch switch to finish");
         this.provider(command.harness);
-        const cwd = resolveHostWorktree(project.cwd, command.worktreeCwd);
+        if (command.cowId && command.autoWorktreeBranch) throw new Error("Choose one isolation mode");
+        const copy = command.cowId ? ownedHostCow(this.store, project.cwd, command.cowId) : undefined;
+        if (copy && this.store.sessions().some((entry) => entry.session.cowId === copy.id))
+          throw new Error("This copy-on-write workspace already belongs to a session. Create a new copy.");
+        if (copy && command.worktreeCwd && command.worktreeCwd !== copy.path) throw new Error("Copy-on-write path does not match its owner");
+        if (copy && this.store.sessions().some((entry) => entry.session.id === copy.sessionId)) throw new Error("Session identity already exists");
+        const cwd = copy ? copy.path : resolveHostWorkspace(this.store, project.cwd, command.worktreeCwd);
+        if (!copy && cwd !== project.cwd && command.worktreeCwd) resolveHostWorktree(project.cwd, command.worktreeCwd);
         const now = Date.now();
         value = {
           projectId: project.id,
@@ -439,8 +448,9 @@ export class HostEngine {
           createdAt: now,
           updatedAt: now,
           session: {
-            id: randomUUID(),
+            id: copy?.sessionId ?? randomUUID(),
             cwd,
+            ...(copy ? { cowId: copy.id, branch: copy.branch, worktreeCwd: copy.path } : {}),
             harness: command.harness,
             model: command.model,
             runtimeMode: command.runtimeMode,
@@ -524,6 +534,11 @@ export class HostEngine {
         } else if (command.type === "send" || command.type === "compact") {
           if (value.status === "running")
             throw new Error("This session is already running");
+          if (value.session.worktreeRemoved) throw new Error("This session workspace was removed. Choose a new working copy before continuing.");
+          if (value.session.cowId) {
+            const copy = ownedHostCow(this.store, this.store.project(value.projectId).cwd, value.session.cowId);
+            if (copy.path !== value.session.cwd || copy.sessionId !== value.session.id) throw new Error("Copy-on-write ownership changed");
+          }
           if (command.type === "compact" && !provider.compact)
             throw new Error(
               "Context compaction is unavailable for this provider",

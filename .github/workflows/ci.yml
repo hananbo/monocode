@@ -22,9 +22,19 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
       - run: npm run test:host
       - run: npm run host:package
+
+  cow-apfs:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -p monocode-isolation
+        env:
+          MONOCODE_REQUIRE_COW: '1'
 
   check:
     strategy:

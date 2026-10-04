@@ -118,6 +118,14 @@ pub struct SessionUpsert {
     #[serde(default)]
     pub worktree_cwd: Option<String>,
     #[serde(default)]
+    pub cow_id: Option<String>,
+    #[serde(default)]
+    pub workspace_mode: Option<String>,
+    #[serde(default)]
+    pub worktree_base: Option<String>,
+    #[serde(default)]
+    pub cow_source_cwd: Option<String>,
+    #[serde(default)]
     pub worktree_removed: bool,
     #[serde(default)]
     pub linked_work_item: Option<Value>,
@@ -144,6 +152,8 @@ pub struct SessionSummary {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_cwd: Option<String>,
+    #[serde(default)]
+    pub cow_id: Option<String>,
     #[serde(default)]
     pub worktree_removed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,6 +199,14 @@ pub struct SessionRecord {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_cwd: Option<String>,
+    #[serde(default)]
+    pub cow_id: Option<String>,
+    #[serde(default)]
+    pub workspace_mode: Option<String>,
+    #[serde(default)]
+    pub worktree_base: Option<String>,
+    #[serde(default)]
+    pub cow_source_cwd: Option<String>,
     #[serde(default)]
     pub worktree_removed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -755,6 +773,10 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("context_window", "INTEGER"),
         ("archived", "INTEGER NOT NULL DEFAULT 0"),
         ("worktree_cwd", "TEXT"),
+        ("cow_id", "TEXT"),
+        ("workspace_mode", "TEXT"),
+        ("worktree_base", "TEXT"),
+        ("cow_source_cwd", "TEXT"),
         ("has_user_message", "INTEGER NOT NULL DEFAULT 0"),
         ("pinned", "INTEGER NOT NULL DEFAULT 0"),
         ("linked_work_item_json", "TEXT"),
@@ -1164,8 +1186,8 @@ fn upsert_session(conn: &Connection, session: &SessionUpsert) -> rusqlite::Resul
            provider_session_id, blocks_json, created_at, updated_at, branch,
            context_used, context_window, worktree_cwd, has_user_message,
            linked_work_item_json, provider_account_id, worktree_removed, is_draft,
-           automation_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+           automation_id, cow_id, workspace_mode, worktree_base, cow_source_cwd
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
          ON CONFLICT(id) DO UPDATE SET
            cwd = excluded.cwd,
            harness = excluded.harness,
@@ -1185,7 +1207,11 @@ fn upsert_session(conn: &Connection, session: &SessionUpsert) -> rusqlite::Resul
            provider_account_id = excluded.provider_account_id,
            worktree_removed = excluded.worktree_removed,
            is_draft = excluded.is_draft,
-           automation_id = excluded.automation_id",
+           automation_id = excluded.automation_id,
+           cow_id = excluded.cow_id,
+           workspace_mode = excluded.workspace_mode,
+           worktree_base = excluded.worktree_base,
+           cow_source_cwd = excluded.cow_source_cwd",
         params![
             session.id,
             session.cwd,
@@ -1208,6 +1234,10 @@ fn upsert_session(conn: &Connection, session: &SessionUpsert) -> rusqlite::Resul
             i64::from(session.worktree_removed),
             i64::from(is_draft),
             automation_id,
+            session.cow_id,
+            session.workspace_mode,
+            session.worktree_base,
+            session.cow_source_cwd,
         ],
     )?;
 
@@ -1224,6 +1254,7 @@ fn upsert_session(conn: &Connection, session: &SessionUpsert) -> rusqlite::Resul
         provider_session_id: provider_session_id.map(str::to_owned),
         branch: branch.map(str::to_owned),
         worktree_cwd: worktree_cwd.map(str::to_owned),
+        cow_id: session.cow_id.clone(),
         worktree_removed: session.worktree_removed,
         repo: git.repo,
         additions: 0,
@@ -1568,7 +1599,7 @@ fn list_by_project(conn: &Connection, cwd: &str) -> rusqlite::Result<Vec<Session
                 created_at, updated_at, branch, archived, pinned,
                 linked_work_item_json,
                 (SELECT summary FROM orchestration_sidebar WHERE lead_id = sessions.id), worktree_cwd,
-                worktree_removed, is_draft, automation_id
+                worktree_removed, is_draft, automation_id, cow_id
          FROM sessions
          WHERE cwd = ?1
            AND has_user_message = 1
@@ -1608,6 +1639,7 @@ fn list_by_project(conn: &Connection, cwd: &str) -> rusqlite::Result<Vec<Session
             draft: row.get::<_, i64>(16)? != 0,
             linked_work_item,
             automation_id: nonempty(row.get(17)?),
+            cow_id: row.get(18)?,
         })
     })?;
     rows.collect()
@@ -1619,7 +1651,7 @@ fn list_linked(conn: &Connection) -> rusqlite::Result<Vec<SessionSummary>> {
                 created_at, updated_at, branch, archived, pinned,
                 linked_work_item_json,
                 (SELECT summary FROM orchestration_sidebar WHERE lead_id = sessions.id), worktree_cwd,
-                worktree_removed, is_draft, automation_id
+                worktree_removed, is_draft, automation_id, cow_id
          FROM sessions
          WHERE has_user_message = 1
            AND linked_work_item_json IS NOT NULL
@@ -1653,6 +1685,7 @@ fn list_linked(conn: &Connection) -> rusqlite::Result<Vec<SessionSummary>> {
             draft: row.get::<_, i64>(16)? != 0,
             linked_work_item: optional_json(row.get(12)?),
             automation_id: nonempty(row.get(17)?),
+            cow_id: row.get(18)?,
         })
     })?;
     rows.collect()
@@ -1841,7 +1874,7 @@ fn get_session(conn: &Connection, session_id: &str) -> rusqlite::Result<Option<S
                 provider_session_id, blocks_json, created_at, updated_at,
                 context_used, context_window, branch, worktree_cwd,
                 linked_work_item_json, provider_account_id, worktree_removed,
-                automation_id
+                automation_id, cow_id, workspace_mode, worktree_base, cow_source_cwd
          FROM sessions
          WHERE id = ?1 AND inbox_ask IS NULL",
         params![session_id],
@@ -1881,6 +1914,10 @@ fn get_session(conn: &Connection, session_id: &str) -> rusqlite::Result<Option<S
                 linked_work_item: optional_json(row.get(15)?),
                 provider_account_id: row.get(16)?,
                 automation_id: nonempty(row.get(18)?),
+                cow_id: row.get(19)?,
+                workspace_mode: row.get(20)?,
+                worktree_base: row.get(21)?,
+                cow_source_cwd: row.get(22)?,
                 created_at: row.get(9)?,
                 updated_at: row.get(10)?,
             })
@@ -2058,6 +2095,10 @@ mod tests {
             context_window: None,
             branch: None,
             worktree_cwd: None,
+            cow_id: None,
+            workspace_mode: None,
+            worktree_base: None,
+            cow_source_cwd: None,
             worktree_removed: false,
             linked_work_item: None,
             automation_id: None,
@@ -2683,6 +2724,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(column, 1);
+    }
+
+    #[test]
+    fn copy_on_write_state_round_trips() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut session = sample("copy", "/tmp/a", "CoW");
+        session.cow_id = Some("owned-copy".into());
+        session.worktree_cwd = Some("/tmp/a-copies/owned-copy".into());
+        assert_eq!(
+            upsert_session(&conn, &session).unwrap().cow_id.as_deref(),
+            Some("owned-copy")
+        );
+        assert_eq!(
+            list_by_project(&conn, "/tmp/a").unwrap()[0]
+                .cow_id
+                .as_deref(),
+            Some("owned-copy")
+        );
+        assert_eq!(
+            get_session(&conn, "copy")
+                .unwrap()
+                .unwrap()
+                .cow_id
+                .as_deref(),
+            Some("owned-copy")
+        );
+        session.cow_id = None;
+        session.worktree_cwd = None;
+        session.workspace_mode = Some("cow".into());
+        session.cow_source_cwd = Some("/tmp/a-copies/parent".into());
+        upsert_session(&conn, &session).unwrap();
+        let restored = get_session(&conn, "copy").unwrap().unwrap();
+        assert_eq!(restored.workspace_mode.as_deref(), Some("cow"));
+        assert_eq!(
+            restored.cow_source_cwd.as_deref(),
+            Some("/tmp/a-copies/parent")
+        );
     }
 
     #[test]

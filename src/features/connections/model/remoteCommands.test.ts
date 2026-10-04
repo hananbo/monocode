@@ -15,6 +15,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeLocal }));
 import { runRemoteCommand } from "./remoteCommands";
 import { parseRemotePath, remotePath } from "./remoteProjects";
 import { listDir, readBinaryFile, readTextFile, statFiles, writeTextFile } from "../../../platform/tauri/fs";
+import { checkCowRemoval } from "../../source-control/model/cow";
 
 beforeEach(() => {
   remoteRequest.mockReset();
@@ -46,6 +47,16 @@ it("runs the same file command on the machine with host paths", async () => {
     command: "list_dir",
     args: { path: "/home/me/repo" },
   });
+});
+
+it("relays CoW cleanup preflight to the owning host", async () => {
+  remoteRequest.mockResolvedValue(undefined);
+  await checkCowRemoval("remote://env/home/me/repo", "owned-copy", true);
+  expect(remoteRequest).toHaveBeenCalledExactlyOnceWith("machine", "workspace.run", {
+    command: "cow_check_remove",
+    args: { cwd: "/home/me/repo", cowId: "owned-copy", force: true },
+  });
+  expect(invokeLocal).not.toHaveBeenCalled();
 });
 
 it("maps path results back and leaves file contents alone", async () => {

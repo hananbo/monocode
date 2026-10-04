@@ -1,3 +1,5 @@
+import { listCowWorkspaces, type CowWorkspace } from "../model/cow";
+import { subscribeGitChanged } from "../../../platform/tauri/fs";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useProjectWorktrees } from "../hooks/useProjectWorktrees";
 import { useWorktreeFocus, type WorktreeFocus } from "../model/worktreeFocus";
@@ -5,6 +7,7 @@ import { pathKey, prettyCwd } from "../../../shared/lib/paths";
 import { Popover } from "../../../shared/ui/Popover";
 import {
   Check,
+  Copy,
   ChevronsUpDown,
   FolderTree,
   GitBranch,
@@ -31,28 +34,74 @@ export function SidebarWorktreeSwitcher({
   const anchor = useRef<HTMLButtonElement>(null);
   const focus = useWorktreeFocus(cwd);
   const { data, error, refresh } = useProjectWorktrees(cwd);
+  const [cowWorkspaces, setCowWorkspaces] = useState<CowWorkspace[]>();
+  const [cowError, setCowError] = useState<string>();
+  const [cowRevision, setCowRevision] = useState(0);
+  useEffect(
+    () => subscribeGitChanged(() => setCowRevision((value) => value + 1)),
+    [],
+  );
+  useEffect(() => {
+    let disposed = false;
+    setCowWorkspaces(undefined);
+    setCowError(undefined);
+    void listCowWorkspaces(cwd).then(
+      (workspaces) => {
+        if (!disposed) setCowWorkspaces(workspaces);
+      },
+      (error) => {
+        if (!disposed) setCowError(String(error));
+      },
+    );
+    return () => {
+      disposed = true;
+    };
+  }, [cwd, cowRevision]);
   // The project folder is the default, unfocused entry; missing worktrees
   // cannot be opened, so they are left out.
   const main = data?.worktrees.find((tree) => tree.isMain);
   const worktrees =
     data?.worktrees.filter((tree) => !tree.isMain && !tree.missing) ?? [];
 
+  const requestedFallback = useRef<string | undefined>(undefined);
   // A deleted worktree cannot stay focused, or new sessions would start there.
   useEffect(() => {
     if (
       focus &&
       !pending &&
       !switchError &&
-      data &&
-      !data.worktrees.some(
-        (tree) =>
-          !tree.isMain &&
-          !tree.missing &&
-          pathKey(tree.path) === pathKey(focus.path),
-      )
-    )
-      onSelect?.(undefined);
-  }, [cwd, data, focus, onSelect, pending, switchError]);
+      (focus.cowId
+        ? cowWorkspaces &&
+          !cowError &&
+          !cowWorkspaces.some(
+            (workspace) =>
+              workspace.id === focus.cowId &&
+              pathKey(workspace.path) === pathKey(focus.path),
+          )
+        : data &&
+          !data.worktrees.some(
+            (tree) =>
+              !tree.isMain &&
+              !tree.missing &&
+              pathKey(tree.path) === pathKey(focus.path),
+          ))
+    ) {
+      const key = `${pathKey(cwd)}\0${focus.cowId ?? pathKey(focus.path)}`;
+      if (requestedFallback.current !== key) {
+        requestedFallback.current = key;
+        onSelect?.(undefined);
+      }
+    } else if (!focus) requestedFallback.current = undefined;
+  }, [
+    cwd,
+    data,
+    cowWorkspaces,
+    cowError,
+    focus,
+    onSelect,
+    pending,
+    switchError,
+  ]);
 
   useEffect(() => {
     if (switchError) setOpen(true);
@@ -61,10 +110,22 @@ export function SidebarWorktreeSwitcher({
   const focused =
     focus &&
     worktrees.find((tree) => pathKey(tree.path) === pathKey(focus.path));
+  const focusedCow = focus?.cowId
+    ? cowWorkspaces?.find((workspace) => workspace.id === focus.cowId)
+    : undefined;
   const title = focus
-    ? (focused?.branch ?? focus.branch ?? "Detached worktree")
+    ? focus.cowId
+      ? `Copy-on-write · ${focusedCow?.branch ?? focus.branch ?? "Detached"}`
+      : (focused?.branch ?? focus.branch ?? "Detached worktree")
     : "Workspace";
-  if (data && worktrees.length === 0 && !focus && !switchError && !pending)
+  if (
+    data &&
+    worktrees.length === 0 &&
+    (cowWorkspaces?.length === 0 || cowError) &&
+    !focus &&
+    !switchError &&
+    !pending
+  )
     return (
       <span className="min-w-0 truncate text-sm font-medium leading-tight">
         {title}
@@ -119,11 +180,17 @@ export function SidebarWorktreeSwitcher({
             : (main?.branch ?? "Project folder")
         }
         onClick={() => {
-          if (!open) void refresh();
+          if (!open) {
+            void refresh();
+            setCowRevision((value) => value + 1);
+          }
           setOpen(!open);
         }}
         className="-ml-1.5 flex h-6.5 min-w-0 max-w-full items-center gap-2 rounded-md px-1.5 text-sm font-medium leading-tight hover:bg-content/8 aria-expanded:bg-content/8"
       >
+        {focus?.cowId ? (
+          <Copy className="size-3.5 shrink-0 text-content/50" />
+        ) : null}
         <span className="min-w-0 truncate">{title}</span>
         {pending ? (
           <Loader
@@ -172,6 +239,28 @@ export function SidebarWorktreeSwitcher({
               tree.path,
             ),
           )}
+          {cowWorkspaces?.map((workspace) =>
+            row(
+              workspace.id,
+              focus?.cowId === workspace.id,
+              <Copy className="size-3.5 shrink-0 text-content/50" />,
+              `Copy-on-write · ${workspace.branch ?? `Detached ${workspace.head.slice(0, 7)}`}`,
+              prettyCwd(workspace.path),
+              () =>
+                onSelect?.({
+                  path: workspace.path,
+                  branch: workspace.branch ?? null,
+                  cowId: workspace.id,
+                  sessionId: workspace.sessionId,
+                }),
+              workspace.path,
+            ),
+          )}
+          {focus?.cowId && cowError ? (
+            <p role="alert" className="px-2 py-2 text-[11px] text-red-400">
+              {cowError}
+            </p>
+          ) : null}
           {switchError || error ? (
             <p role="alert" className="px-2 py-2 text-[11px] text-red-400">
               {switchError || error}

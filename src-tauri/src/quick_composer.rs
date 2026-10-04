@@ -324,11 +324,12 @@ fn validate_workspace(request: &QuickLaunch) -> Result<(), String> {
     if request
         .workspace_mode
         .as_deref()
-        .is_some_and(|mode| !matches!(mode, "current" | "worktree"))
+        .is_some_and(|mode| !matches!(mode, "current" | "worktree" | "cow"))
         || request.worktree_base.as_deref().is_some_and(|base| {
             base.trim().is_empty() || request.workspace_mode.as_deref() != Some("worktree")
         })
-        || (request.workspace_mode.as_deref() == Some("worktree") && request.worktree_cwd.is_some())
+        || (matches!(request.workspace_mode.as_deref(), Some("worktree" | "cow"))
+            && request.worktree_cwd.is_some())
     {
         return Err("Select a valid workspace for this session.".into());
     }

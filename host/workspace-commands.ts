@@ -1,3 +1,4 @@
+import { hostCow, type HostCow, resolveHostWorkspaceAsync } from "./cow";
 import {
   cp,
   lstat,
@@ -76,6 +77,14 @@ export const WORKSPACE_COMMANDS = [
   "git_stash",
   "git_worktrees",
   "search_project",
+  "cow_capability",
+  "cow_create",
+  "cow_list",
+  "cow_status",
+  "cow_file_diff",
+  "cow_remove",
+  "cow_check_remove",
+  "cow_apply",
 ] as const;
 export type WorkspaceCommand = (typeof WORKSPACE_COMMANDS)[number];
 
@@ -115,6 +124,8 @@ export class WorkspaceCommands {
       args && typeof args === "object" && !Array.isArray(args)
         ? (args as Record<string, unknown>)
         : {};
+    if (String(command).startsWith("cow_"))
+      return this.cow(String(command), input);
     switch (command as WorkspaceCommand) {
       case "list_dir":
         return this.listDir(input.path);
@@ -201,7 +212,62 @@ export class WorkspaceCommands {
         return this.gitWorktrees(input.cwd);
       case "search_project":
         return this.searchProject(input.options);
+      default:
+        throw new Error("Unsupported workspace command");
     }
+  }
+
+  private async cow(
+    command: string,
+    input: Record<string, unknown>,
+  ): Promise<unknown> {
+    const cwd = await this.gitRoot(input.cwd);
+    const project = this.store
+      .projects()
+      .find(
+        (item) =>
+          item.cwd === cwd || this.roots.get(item.cwd)?.roots.includes(cwd),
+      );
+    if (!project) throw new Error("Project is unavailable");
+    for (const key of ["projectCwd", "toCwd"]) {
+      if (input[key] !== undefined)
+        input[key] = await resolveHostWorkspaceAsync(
+          this.store,
+          project.cwd,
+          input[key],
+        );
+    }
+    if (command === "cow_create") input.projectCwd = project.cwd;
+    const action = async () => {
+      if (command === "cow_list") {
+        const copies = await hostCow<HostCow[]>(this.store, command, { ...input, cwd });
+        return copies.map((copy) => ({ ...copy, sessionIds: this.store.cowWorkspaceSessions(copy.id, copy.path).map((value) => value.session.id) }));
+      }
+      if (command !== "cow_remove") return hostCow(this.store, command, { ...input, cwd });
+      const copy = (await hostCow<HostCow[]>(this.store, "cow_list", { cwd: project.cwd })).find((item) => item.id === input.cowId);
+      if (!copy) throw new Error("Unknown copy-on-write workspace");
+      await hostCow(this.store, "cow_check_remove", { ...input, cwd });
+      if (!copy.rootIdentity) throw new Error("Update MonoCode Host to safely remove this workspace");
+      const sessions = this.store.prepareCowRemoval(copy.id, copy.path, copy.projectCwd, input.keepSessions === true, copy.rootIdentity);
+      try {
+        await hostCow(this.store, command, { ...input, cwd });
+      } catch (error) {
+        if (!this.store.finishCowRemoval(copy.path, true)) throw error;
+        console.error("Workspace removed; cleanup failed:", error);
+      }
+      try {
+        this.store.finishCowRemoval(copy.path);
+      } catch (error) {
+        console.error("Workspace removed; journal cleanup will retry on restart:", error);
+      }
+      return { sessionIds: sessions.map((value) => value.session.id), projectCwd: copy.projectCwd };
+    };
+    const result =
+      command === "cow_remove"
+        ? await this.withIdleProject(project.id, action)
+        : await action();
+    this.invalidateRoots();
+    return result;
   }
 
   /** The project folders and worktrees files may be read and written in. */
@@ -222,6 +288,13 @@ export class WorkspaceCommands {
             .map((tree) => tree.path),
         ])
         .catch(() => [project.cwd]);
+      roots.push(
+        ...(await hostCow<HostCow[]>(this.store, "cow_list", {
+          cwd: project.cwd,
+        }).then((items) =>
+          items.filter((item) => !item.missing).map((item) => item.path),
+        )),
+      );
       if (generation === this.rootsGeneration)
         this.roots.set(project.cwd, { at: Date.now(), roots });
       out.push(...roots);
@@ -497,7 +570,9 @@ export class WorkspaceCommands {
   }
 
   private async gitSync(cwd: unknown) {
-    await this.gitCommand(cwd, ["pull", "--ff-only"]);
+    const upstream = await this.gitCommand(cwd, ["rev-parse", "--abbrev-ref", "@{upstream}"])
+      .catch(() => undefined);
+    if (upstream) await this.gitCommand(cwd, ["pull", "--ff-only"]);
     await this.gitAction(cwd, "push");
   }
 

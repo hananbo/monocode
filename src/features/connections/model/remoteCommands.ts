@@ -46,9 +46,11 @@ const HOST_COMMANDS = new Set([
   "git_stash",
   "git_worktrees",
   "search_project",
+  "cow_capability", "cow_create", "cow_list", "cow_status", "cow_file_diff",
+  "cow_remove", "cow_check_remove", "cow_apply",
 ]);
 /** Arguments that hold paths; everything else is passed through untouched. */
-const PATH_ARGS = ["path", "cwd", "parent", "from", "destParent", "paths"];
+const PATH_ARGS = ["path", "cwd", "parent", "from", "destParent", "paths", "projectCwd", "targetCwd", "toCwd"];
 /** Commands whose string result is a path. */
 const PATH_RESULTS = new Set([
   "create_path",
@@ -158,6 +160,16 @@ export async function runRemoteCommand(
       defaultRoot: fromHost(worktrees.defaultRoot),
       worktrees: worktrees.worktrees.map((tree) => ({ ...tree, path: fromHost(tree.path) })),
     };
+  }
+  if (command.startsWith("cow_")) {
+    const translate = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(translate);
+      if (!value || typeof value !== "object") return value;
+      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key,
+        ["path", "sourceCwd", "projectCwd"].includes(key) && typeof item === "string"
+          ? fromHost(item) : item]));
+    };
+    return translate(result);
   }
   return result;
 }

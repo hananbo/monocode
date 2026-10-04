@@ -98,7 +98,13 @@ export function applyAddToChatRequest({
   const file = focusedFileTab(tab);
   const session = createdSession ?? {
     ...newDefaultSession(cwd, defaultRuntimeMode),
-    ...(file?.projectCwd ? { worktreeCwd: file.cwd } : {}),
+    ...(file?.projectCwd
+      ? {
+          worktreeCwd: file.cwd,
+          workspaceMode: undefined,
+          worktreeBase: undefined,
+        }
+      : {}),
     composerSeed,
   };
 

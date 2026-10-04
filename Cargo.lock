@@ -2348,6 +2348,7 @@ dependencies = [
  "base64 0.22.1",
  "block2",
  "libc",
+ "monocode-isolation",
  "notify-rust",
  "objc2",
  "objc2-app-kit",
@@ -2378,6 +2379,17 @@ dependencies = [
  "uuid",
  "windows 0.62.2",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "monocode-isolation"
+version = "0.7.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]

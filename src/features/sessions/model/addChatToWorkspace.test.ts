@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { leafIds, newFileTab, newTab, type WorkspaceTab } from "../../workspace/model/layout";
 import type { Session } from "./session";
 import { applyAddToChatRequest } from "./addChatToWorkspace";
+import * as settings from "../../settings/model/settings";
 
 function session(id: string, cwd: string, overrides: Partial<Session> = {}): Session {
   return {
@@ -142,6 +143,34 @@ describe("applyAddToChatRequest: zero-tab fallback", () => {
 });
 
 describe("applyAddToChatRequest: file-only tab", () => {
+  it.each(["cow", "worktree"] as const)(
+    "keeps the selected worktree when new sessions default to %s",
+    (mode) => {
+      const preference = vi.spyOn(settings, "loadDefaultIsolationMode").mockReturnValue(mode);
+      try {
+        const tab = fileOnlyTab("feature", "/repo-worktrees/feature");
+        tab.focusedId = "pane";
+        tab.layout = { type: "leaf", id: "pane" };
+        tab.editorPanes[0].files[0].projectCwd = "/repo";
+        const result = applyAddToChatRequest({
+          sessions: [],
+          tabs: [tab],
+          activeTabId: tab.id,
+          projectCwd: "/repo",
+          text: "Review this feature code",
+        });
+        const chat = newChat(result!);
+        expect(chat.cwd).toBe("/repo");
+        expect(chat.worktreeCwd).toBe("/repo-worktrees/feature");
+        expect(chat.workspaceMode).toBeUndefined();
+        expect(chat.worktreeBase).toBeUndefined();
+        expect(chat.composerSeed).toContain("Review this feature code");
+      } finally {
+        preference.mockRestore();
+      }
+    },
+  );
+
   it("splits the new chat beside the file pane", () => {
     const tab = fileOnlyTab("tab1", "/current/project");
     const result = applyAddToChatRequest({
