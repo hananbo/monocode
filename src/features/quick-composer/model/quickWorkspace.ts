@@ -80,7 +80,14 @@ export function applyQuickWorkspace(
     };
   }
   if (launch.workspaceMode === "current")
-    return { ...session, workspaceMode: undefined, worktreeBase: undefined };
+    return {
+      ...session,
+      workspaceMode: undefined,
+      worktreeBase: undefined,
+      worktreeCwd: undefined,
+      cowId: undefined,
+      cowSourceCwd: undefined,
+    };
   return launch.worktreeCwd
     ? {
         ...session,

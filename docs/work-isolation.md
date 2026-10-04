@@ -22,6 +22,10 @@ when the source is a linked worktree. It retains local branches, remote tracking
 refs, tags, and the Git configuration needed by the normal controls, and starts
 on a new `mc/…` branch. Selecting another base changes only the copy; Git refuses
 to overwrite conflicting dirty or untracked files.
+If effective Git filters are configured, creation accepts only the current HEAD.
+Another base could require running smudge filters or downloading content; choose
+a worktree for that base. This keeps internal creation free of filter execution
+and remote access while preserving already converted files in current-HEAD copies.
 
 Git publishing uses the copy's independent branch and index with the originating
 repository's effective SSH and credential-helper configuration. Keys and
@@ -87,6 +91,17 @@ selected existing workspace takes precedence over the default isolation setting.
 Ownership records live in app data under `isolation`. New baselines live outside
 session checkouts at `<project>-cow/.baselines/<cowId>` on the clone's filesystem.
 Existing app-data baselines remain readable without recapturing the baseline.
+Source verification compares file identities, sizes, modes, nanosecond timestamps,
+and symlink targets; it does not read ignored file contents. Snapshot capture
+imports eligible file and symlink blobs through one Git process. Helper responses
+omit private baselines and ignored-file lists. Host ownership checks read only
+registered metadata and directory identities, without waiting for the mutation
+lock or calculating Git status.
+
+Creation records a durable intent before cloning files. If interrupted before
+registration, a later locked isolation request cleans up the abandoned checkout
+and baseline only when their recorded directory identities still match. Replaced
+or unrelated paths are retained. Completed registration is published atomically.
 
 ## Archive and deletion
 
@@ -113,6 +128,10 @@ originating project before removing files; conflicting branch names are retained
 under `mc/kept-<cowId>/…` without overwriting existing branches. Failure to retain
 history blocks deletion, including forced deletion. Deleting a session can also
 remove its unused clean working copy.
+Unchanged inherited branches and tags are skipped, so cleanup does not recreate
+source refs the user deleted or duplicate source history changed independently.
+The session's generated branch is still retained. Older records without creation
+ref metadata retain uncertain history under the copy's `mc/kept-<cowId>/…` namespace.
 
 Stashed work is retained in the originating repository before deletion, including
 older stash entries. Session detachment is journaled on desktop and remote hosts

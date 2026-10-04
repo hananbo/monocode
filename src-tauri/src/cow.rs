@@ -80,12 +80,10 @@ fn owned_copy(
         .app_data_dir()
         .map_err(|e| e.to_string())?
         .join("isolation");
-    let listed =
-        monocode_isolation::dispatch(&isolation, json!({"command":"cow_list","args":{"cwd":cwd}}))?;
-    let row = listed
-        .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(cow_id)))
-        .ok_or("Copy-on-write workspace is unavailable")?;
+    let row = monocode_isolation::dispatch(
+        &isolation,
+        json!({"command":"cow_owner","args":{"cwd":cwd,"cowId":cow_id}}),
+    )?;
     let path = row["path"]
         .as_str()
         .ok_or("Copy-on-write path is unavailable")?;
@@ -93,11 +91,13 @@ fn owned_copy(
         .as_str()
         .ok_or("Copy-on-write project is unavailable")?;
     let identity = (
-        row["identity"][0]
-            .as_u64()
+        row["rootIdentity"][0]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
             .ok_or("Copy-on-write ownership identity is unavailable")?,
-        row["identity"][1]
-            .as_u64()
+        row["rootIdentity"][1]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
             .ok_or("Copy-on-write ownership identity is unavailable")?,
     );
     Ok((

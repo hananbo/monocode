@@ -70,6 +70,7 @@ export function WorktreesPage({
   );
   const { data, error: loadError, refresh } = useProjectWorktrees(project);
   const [error, setError] = useState<string>();
+  const [cowError, setCowError] = useState<string>();
   const [cowWorkspaces, setCowWorkspaces] = useState<CowWorkspace[]>([]);
   const [cowRefresh, setCowRefresh] = useState(0);
   const workspaces: (Worktree & { cowId?: string })[] = [
@@ -90,6 +91,7 @@ export function WorktreesPage({
   ];
   useEffect(() => {
     setCowWorkspaces([]);
+    setCowError(undefined);
   }, [project]);
   useEffect(() => {
     const refreshCopies = () => setCowRefresh((value) => value + 1);
@@ -105,10 +107,13 @@ export function WorktreesPage({
     if (project)
       void listCowWorkspaces(project).then(
         (rows) => {
-          if (!disposed) setCowWorkspaces(rows);
+          if (!disposed) {
+            setCowWorkspaces(rows);
+            setCowError(undefined);
+          }
         },
         (error) => {
-          if (!disposed) setError(String(error));
+          if (!disposed) setCowError(String(error));
         },
       );
     return () => {
@@ -173,6 +178,11 @@ export function WorktreesPage({
       {error && (
         <p role="alert" className="break-words text-[12px] text-red-400">
           {error}
+        </p>
+      )}
+      {cowError && (
+        <p role="alert" className="break-words text-[12px] text-red-400">
+          {cowError}
         </p>
       )}
       {!project ? (

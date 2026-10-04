@@ -670,7 +670,10 @@ function ConnectedRemoteSession({
       if (!alive.current || version !== bindingVersion.current) return undefined;
       const message = String(reason);
       if (message.includes("Host rejected request:")) {
-        settleTurn(command.commandId, { status: "failed", text: "", error: message });
+        const trackedCommandId = optimistic?.commandId ?? (command.type === "create"
+          ? pendingRemoteFollowup(project.key, machine.environmentId, command.commandId)?.commandId
+          : undefined) ?? command.commandId;
+        settleTurn(trackedCommandId, { status: "failed", text: "", error: message });
         if (command.type === "send" || command.type === "compact")
           setUnseenSend((current) =>
             current?.commandId === command.commandId ? undefined : current,
@@ -862,6 +865,7 @@ function ConnectedRemoteSession({
           if (alive.current && version === bindingVersion.current) {
             setError(String(reason));
             setStarting({ ...turn, failed: true });
+            settleTurn(turn.commandId, { status: "failed", text: "", error: String(reason) });
           }
           return;
         }
@@ -869,9 +873,10 @@ function ConnectedRemoteSession({
       const followup: Exclude<HostCommand, { type: "create" }> = turn.draft
         ? { type: "draft", commandId: turn.commandId, sessionId: "", text: turn.text, attachments: uploaded }
         : message("", turn.text, turn.commandId, uploaded, turn.intent, turn.draftBlockId, turn.planBlockId);
+      const createCommandId = crypto.randomUUID();
       const receipt = await run({
         type: "create",
-        commandId: crypto.randomUUID(),
+        commandId: createCommandId,
         projectId: project.projectId,
         ...(worktreeCwd !== project.cwd ? { worktreeCwd } : {}),
         ...(autoWorktreeBranch ? { autoWorktreeBranch } : {}),
@@ -883,7 +888,12 @@ function ConnectedRemoteSession({
       }, turn, followup);
       if (version !== bindingVersion.current) return;
       if (!receipt) {
-        if (alive.current) setStarting({ ...turn, failed: true });
+        if (alive.current) {
+          setStarting({ ...turn, failed: true });
+          // An ambiguous response keeps the original command available for retry.
+          if (pendingRemoteCommand(project.key, machine.environmentId, null, shell.id)?.commandId !== createCommandId)
+            settleTurn(turn.commandId, { status: "failed", text: "", error: "Remote session could not be created" });
+        }
         return;
       }
       if (version !== bindingVersion.current) return;

@@ -1184,3 +1184,120 @@ it("settles an interrupted remote turn as failure", async () => {
   await settle();
   expect(onSettled).toHaveBeenCalledExactlyOnceWith({ status: "failed", text: "Done", error: "Remote provider turn was interrupted" });
 });
+
+it.each(["create", "worktree"])(
+  "settles the first turn when the host rejects %s creation",
+  async (failure) => {
+    const original = vi.mocked(invoke).getMockImplementation()!;
+    vi.mocked(invoke).mockImplementation(async (command, input) => {
+      const request = input as
+        { method?: string; params?: HostCommand } | undefined;
+      if (
+        (failure === "create" &&
+          request?.method === "commands.dispatch" &&
+          request.params?.type === "create") ||
+        (failure === "worktree" && request?.method === "git.worktreeCreate")
+      )
+        throw new Error("Host rejected request: creation unavailable");
+      return original(command, input);
+    });
+    const onSettled = vi.fn();
+    await render({
+      ...shell(),
+      workspaceMode: failure === "worktree" ? "worktree" : "current",
+    });
+    await act(async () => {
+      expect(
+        remoteSessionActions("shell")!.submit("Resolve conflicts", [], {
+          onSettled,
+        }),
+      ).toBe(true);
+    });
+    await settle();
+    expect(onSettled).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        status: "failed",
+        error: expect.stringContaining("creation unavailable"),
+      }),
+    );
+  },
+);
+
+it("keeps an ambiguous create response unsettled until retry delivers the turn", async () => {
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  let accepted: ReturnType<typeof dispatch> | undefined;
+  vi.mocked(invoke).mockImplementation(async (command, input) => {
+    const request = input as
+      { method?: string; params?: HostCommand } | undefined;
+    if (
+      request?.method === "commands.dispatch" &&
+      request.params?.type === "create"
+    ) {
+      if (accepted) return accepted;
+      accepted = dispatch(request.params);
+      throw new Error("Response lost after acceptance");
+    }
+    return original(command, input);
+  });
+  const onSettled = vi.fn();
+  await render();
+  await act(async () => {
+    expect(
+      remoteSessionActions("shell")!.submit("Resolve conflicts", [], {
+        onSettled,
+      }),
+    ).toBe(true);
+  });
+  await settle();
+  expect(onSettled).not.toHaveBeenCalled();
+  const retry = [...container.querySelectorAll("button")].find(
+    (button) => button.textContent === "Retry",
+  )!;
+  await act(async () => retry.click());
+  await settle();
+  expect(onSettled).toHaveBeenCalledExactlyOnceWith({
+    status: "completed",
+    text: "Done",
+  });
+});
+
+it("settles the tracked first turn when an ambiguous create retry is rejected", async () => {
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  let attempts = 0;
+  vi.mocked(invoke).mockImplementation(async (command, input) => {
+    const request = input as
+      { method?: string; params?: HostCommand } | undefined;
+    if (
+      request?.method === "commands.dispatch" &&
+      request.params?.type === "create"
+    )
+      throw new Error(
+        ++attempts === 1
+          ? "Response lost"
+          : "Host rejected request: creation unavailable",
+      );
+    return original(command, input);
+  });
+  const onSettled = vi.fn();
+  await render();
+  await act(async () => {
+    expect(
+      remoteSessionActions("shell")!.submit("Resolve conflicts", [], {
+        onSettled,
+      }),
+    ).toBe(true);
+  });
+  await settle();
+  expect(onSettled).not.toHaveBeenCalled();
+  const retry = [...container.querySelectorAll("button")].find(
+    (button) => button.textContent === "Retry",
+  )!;
+  await act(async () => retry.click());
+  await settle();
+  expect(onSettled).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      status: "failed",
+      error: expect.stringContaining("creation unavailable"),
+    }),
+  );
+});

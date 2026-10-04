@@ -405,7 +405,7 @@ export function createHostServer(
             break;
           }
           case "commands.dispatch":
-            result = engine.command(params);
+            result = await engine.commandAsync(params);
             break;
           case "attachments.upload":
             result = writeAttachmentChunk(engine.store, params);

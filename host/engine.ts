@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { basename, isAbsolute } from "node:path";
-import { renameHostWorktreeBranch, resolveHostWorktree } from "./git-worktrees";
-import { ownedHostCow, resolveHostWorkspace } from "./cow";
+import { renameHostWorktreeBranch, resolveHostWorktree, resolveHostWorktreeAsync } from "./git-worktrees";
+import { assertHostCowIdentity, ownedHostCow, type HostCow } from "./cow";
 import {
   applyHarnessEvent,
   stopStreaming,
@@ -413,9 +413,44 @@ export class HostEngine {
     this.retryTimers.set(id, timer);
   }
 
-  command(raw: unknown): CommandReceipt {
+  /** Native ownership checks run before the SQLite transaction and never block RPCs. */
+  async commandAsync(raw: unknown): Promise<CommandReceipt> {
     if (this.closing) throw new Error("Host is stopping");
     const command = parseCommand(raw);
+    const signature = createHash("sha256").update(JSON.stringify(command)).digest("hex");
+    const previous = this.store.receipt(command.commandId, signature);
+    if (previous) return previous;
+    let authorization: { projectCwd: string; cwd?: string; copy?: HostCow } | undefined;
+    if (command.type === "create") {
+      const project = this.store.project(command.projectId);
+      if (command.cowId && command.autoWorktreeBranch) throw new Error("Choose one isolation mode");
+      authorization = {
+        projectCwd: project.cwd,
+        ...(command.cowId
+          ? { copy: await ownedHostCow(this.store, project.cwd, command.cowId) }
+          : { cwd: await resolveHostWorktreeAsync(project.cwd, command.worktreeCwd) }),
+      };
+    } else if (command.type === "send" || command.type === "compact") {
+      const value = this.store.session(command.sessionId);
+      if (value.session.worktreeRemoved) throw new Error("This session workspace was removed. Choose a new working copy before continuing.");
+      if (value.session.cowId) {
+        const project = this.store.project(value.projectId);
+        authorization = { projectCwd: project.cwd, copy: await ownedHostCow(this.store, project.cwd, value.session.cowId) };
+      }
+    }
+    return this.applyCommand(command, authorization);
+  }
+
+  command(raw: unknown): CommandReceipt {
+    return this.applyCommand(parseCommand(raw));
+  }
+
+  private applyCommand(command: HostCommand, authorization?: {
+    projectCwd: string;
+    cwd?: string;
+    copy?: HostCow;
+  }): CommandReceipt {
+    if (this.closing) throw new Error("Host is stopping");
     const signature = createHash("sha256")
       .update(JSON.stringify(command))
       .digest("hex");
@@ -432,13 +467,15 @@ export class HostEngine {
           throw new Error("Wait for the branch switch to finish");
         this.provider(command.harness);
         if (command.cowId && command.autoWorktreeBranch) throw new Error("Choose one isolation mode");
-        const copy = command.cowId ? ownedHostCow(this.store, project.cwd, command.cowId) : undefined;
+        if (authorization && authorization.projectCwd !== project.cwd) throw new Error("Project changed during workspace validation");
+        const copy = command.cowId ? authorization?.copy : undefined;
+        if (command.cowId && (!copy || copy.id !== command.cowId)) throw new Error("Use async dispatch to verify copy-on-write ownership");
+        if (copy) assertHostCowIdentity(copy);
         if (copy && this.store.sessions().some((entry) => entry.session.cowId === copy.id))
           throw new Error("This copy-on-write workspace already belongs to a session. Create a new copy.");
         if (copy && command.worktreeCwd && command.worktreeCwd !== copy.path) throw new Error("Copy-on-write path does not match its owner");
         if (copy && this.store.sessions().some((entry) => entry.session.id === copy.sessionId)) throw new Error("Session identity already exists");
-        const cwd = copy ? copy.path : resolveHostWorkspace(this.store, project.cwd, command.worktreeCwd);
-        if (!copy && cwd !== project.cwd && command.worktreeCwd) resolveHostWorktree(project.cwd, command.worktreeCwd);
+        const cwd = copy?.path ?? authorization?.cwd ?? resolveHostWorktree(project.cwd, command.worktreeCwd);
         const now = Date.now();
         value = {
           projectId: project.id,
@@ -536,8 +573,9 @@ export class HostEngine {
             throw new Error("This session is already running");
           if (value.session.worktreeRemoved) throw new Error("This session workspace was removed. Choose a new working copy before continuing.");
           if (value.session.cowId) {
-            const copy = ownedHostCow(this.store, this.store.project(value.projectId).cwd, value.session.cowId);
-            if (copy.path !== value.session.cwd || copy.sessionId !== value.session.id) throw new Error("Copy-on-write ownership changed");
+            const copy = authorization?.copy;
+            if (!copy || authorization?.projectCwd !== this.store.project(value.projectId).cwd || copy.id !== value.session.cowId || copy.path !== value.session.cwd || copy.sessionId !== value.session.id) throw new Error("Copy-on-write ownership changed");
+            assertHostCowIdentity(copy);
           }
           if (command.type === "compact" && !provider.compact)
             throw new Error(

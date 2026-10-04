@@ -4,6 +4,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("../../source-control/model/cow", () => ({ cowCapability: vi.fn().mockResolvedValue({ supported: false }) }));
+import { cowCapability } from "../../source-control/model/cow";
+
 const mcpInvoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", async (importOriginal) => {
   const original =
@@ -88,6 +91,7 @@ describe("Composer question focus", () => {
   let root: Root;
 
   beforeEach(() => {
+    vi.mocked(cowCapability).mockReset().mockResolvedValue({ supported: false });
     clearMcpSettingsCache();
     mcpInvoke.mockReset();
     mcpInvoke.mockImplementation(async (command: string) =>
@@ -1761,4 +1765,79 @@ describe("Composer question focus", () => {
       window.removeEventListener("monocode:open-mcp-settings", onOpen);
     }
   });
+  it.each(["rapid", "started", "switched"])(
+    "rechecks draft state after a pending isolation shortcut (%s)",
+    async (scenario) => {
+      const onWorkspaceModeChange = vi.fn();
+      const props = {
+        focused: true,
+        harness: "claude" as const,
+        model: "claude-sonnet",
+        runtimeMode: "supervised" as const,
+        cwd: "/repo",
+        executionCwd: "/repo",
+        sessionId: "draft",
+        branch: "main",
+        hideProjectPicker: true,
+        draftWorkspace: true,
+        workspaceMode: "current" as const,
+        onFocus: vi.fn(),
+        onCwdChange: vi.fn(),
+        onModelChange: vi.fn(),
+        onRuntimeModeChange: vi.fn(),
+        onSubmit: vi.fn(),
+        onWorkspaceModeChange,
+      };
+      await act(async () => root.render(createElement(Composer, props)));
+      const pending: ((value: { supported: boolean }) => void)[] = [];
+      vi.mocked(cowCapability).mockImplementation(
+        () => new Promise((resolve) => pending.push(resolve)),
+      );
+      const shortcut = () =>
+        container
+          .querySelector("textarea")!
+          .dispatchEvent(
+            new KeyboardEvent("keydown", {
+              key: "g",
+              ctrlKey: true,
+              shiftKey: true,
+              bubbles: true,
+              cancelable: true,
+            }),
+          );
+      await act(async () => {
+        shortcut();
+        if (scenario === "rapid") shortcut();
+      });
+      expect(onWorkspaceModeChange).not.toHaveBeenCalled();
+      if (scenario === "started")
+        await act(async () =>
+          root.render(
+            createElement(Composer, {
+              ...props,
+              draftWorkspace: false,
+              busy: true,
+            }),
+          ),
+        );
+      if (scenario === "switched")
+        await act(async () =>
+          root.render(
+            createElement(Composer, { ...props, sessionId: "another-draft" }),
+          ),
+        );
+      await act(async () =>
+        pending.forEach((resolve) => resolve({ supported: true })),
+      );
+      expect(onWorkspaceModeChange.mock.calls).toEqual(
+        scenario === "rapid"
+          ? [
+              ["worktree", "main"],
+              ["cow", "main"],
+            ]
+          : [],
+      );
+    },
+  );
+
 });

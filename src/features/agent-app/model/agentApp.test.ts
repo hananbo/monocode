@@ -1,4 +1,4 @@
-import { saveDefaultIsolationMode } from "../../settings/model/settings";
+import { loadDefaultIsolationMode, saveDefaultIsolationMode } from "../../settings/model/settings";
 // @vitest-environment happy-dom
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { newSession } from "../../sessions/model/session";
@@ -323,11 +323,16 @@ describe("agent app commands", () => {
 
   it("uses the isolation default for CLI launches while preserving explicit local choices", async () => {
     const { source, host } = fixture();
-    saveDefaultIsolationMode("cow");
-    await handleAgentApp(source, "default-copy", "sessions.start", { prompt: "A" }, host);
-    expect(host.start).toHaveBeenLastCalledWith(expect.objectContaining({ workspaceMode: "cow" }), "app-lead-default-copy");
-    await handleAgentApp(source, "explicit-local", "sessions.start", { prompt: "A", workspaceMode: "current" }, host);
-    expect(host.start).toHaveBeenLastCalledWith(expect.objectContaining({ workspaceMode: "current" }), "app-lead-explicit-local");
+    const previous = loadDefaultIsolationMode();
+    try {
+      saveDefaultIsolationMode("cow");
+      await handleAgentApp(source, "default-copy", "sessions.start", { prompt: "A" }, host);
+      expect(host.start).toHaveBeenLastCalledWith(expect.objectContaining({ workspaceMode: "cow" }), "app-lead-default-copy");
+      await handleAgentApp(source, "explicit-local", "sessions.start", { prompt: "A", workspaceMode: "current" }, host);
+      expect(host.start).toHaveBeenLastCalledWith(expect.objectContaining({ workspaceMode: "current" }), "app-lead-explicit-local");
+    } finally {
+      saveDefaultIsolationMode(previous);
+    }
   });
 
   it("starts copy-on-write sessions with a base and rejects conflicting working copies", async () => {

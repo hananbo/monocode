@@ -116,3 +116,28 @@ it("blocks unavailable CoW instead of silently switching isolation", async () =>
     quickWorkspaceLaunch({ cwd: base.cwd, mode: "cow" }),
   ).rejects.toThrow("Unsupported filesystem");
 });
+
+it("clears an inherited isolated workspace when explicitly launching locally", () => {
+  const session = {
+    ...newSession("codex", base.cwd),
+    workspaceMode: "cow" as const,
+    worktreeBase: "main",
+    worktreeCwd: "/tmp/project-cow/copy",
+    cowId: "copy",
+    cowSourceCwd: "/tmp/project-cow/source",
+  };
+  const local = applyQuickWorkspace(session, {
+    ...base,
+    workspaceMode: "current",
+  });
+  expect(local).toMatchObject({ cwd: base.cwd });
+  for (const key of [
+    "workspaceMode",
+    "worktreeBase",
+    "worktreeCwd",
+    "cowId",
+    "cowSourceCwd",
+  ] as const)
+    expect(local[key]).toBeUndefined();
+  expect(session.worktreeCwd).toBe("/tmp/project-cow/copy");
+});

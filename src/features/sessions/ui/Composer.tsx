@@ -629,6 +629,32 @@ export function Composer({
     workspaceMode,
     worktreeBase,
   ]);
+  const workspaceShortcutRef = useRef({
+    sessionId,
+    cwd,
+    executionCwd,
+    draftResetToken,
+    draftWorkspace,
+    disabled,
+    enabled,
+    busy,
+    workspaceMode,
+    resolvedWorktreeBase,
+    onWorkspaceModeChange,
+  });
+  workspaceShortcutRef.current = {
+    sessionId,
+    cwd,
+    executionCwd,
+    draftResetToken,
+    draftWorkspace,
+    disabled,
+    enabled,
+    busy,
+    workspaceMode,
+    resolvedWorktreeBase,
+    onWorkspaceModeChange,
+  };
   const [hasValue, setHasValue] = useState(
     () =>
       (initialDraft ?? "").trim().length > 0 ||
@@ -1864,19 +1890,38 @@ export function Composer({
     }
     e.preventDefault();
     e.stopPropagation();
+    const captured = workspaceShortcutRef.current;
     void cowCapability(cwd)
       .catch(() => ({ supported: false }))
       .then((capability) => {
+        const latest = workspaceShortcutRef.current;
+        if (
+          !ref.current ||
+          latest.sessionId !== captured.sessionId ||
+          latest.cwd !== captured.cwd ||
+          latest.executionCwd !== captured.executionCwd ||
+          latest.draftResetToken !== captured.draftResetToken ||
+          !latest.draftWorkspace ||
+          !latest.onWorkspaceModeChange ||
+          latest.disabled ||
+          !latest.enabled ||
+          latest.busy ||
+          submitLockRef.current
+        )
+          return;
         const modes: WorkspaceMode[] = [
           "current",
-          ...(resolvedWorktreeBase ? ["worktree" as const] : []),
+          ...(latest.resolvedWorktreeBase ? ["worktree" as const] : []),
           ...(capability.supported ? ["cow" as const] : []),
         ];
         const next =
-          modes[(modes.indexOf(workspaceMode ?? "current") + 1) % modes.length];
-        onWorkspaceModeChange(
+          modes[
+            (modes.indexOf(latest.workspaceMode ?? "current") + 1) % modes.length
+          ];
+        workspaceShortcutRef.current = { ...latest, workspaceMode: next };
+        latest.onWorkspaceModeChange(
           next,
-          next !== "current" ? resolvedWorktreeBase : undefined,
+          next !== "current" ? latest.resolvedWorktreeBase : undefined,
         );
       });
     ref.current?.focus();

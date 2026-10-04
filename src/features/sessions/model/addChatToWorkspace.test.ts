@@ -1,3 +1,4 @@
+import { workspaceTabCwd } from "../../workspace/model/workspaceTabGroups";
 import { describe, expect, it, vi } from "vitest";
 import { leafIds, newFileTab, newTab, type WorkspaceTab } from "../../workspace/model/layout";
 import type { Session } from "./session";
@@ -203,4 +204,37 @@ describe("applyAddToChatRequest: file-only tab", () => {
 
     expect(result).toBeNull();
   });
+});
+
+describe("add-to-chat from an existing copy-on-write workspace", () => {
+  it.each([false, true])(
+    "constructs a fresh copy session without mutating the source (no tabs: %s)",
+    (empty) => {
+      const source = {
+        ...session("copy-source", "/repo"),
+        cowId: "source",
+        worktreeCwd: "/repo-cow/source",
+      };
+      const tab = fileOnlyTab("copy-file", source.worktreeCwd);
+      const before = JSON.stringify({ source, tab });
+      const result = applyAddToChatRequest({
+        sessions: [source],
+        tabs: empty ? [] : [tab],
+        activeTabId: tab.id,
+        projectCwd: source.worktreeCwd,
+        text: "Review selected code",
+      })!;
+      const added = newChat(result);
+      expect(added).toMatchObject({
+        cwd: "/repo",
+        workspaceMode: "cow",
+        cowSourceCwd: source.worktreeCwd,
+      });
+      expect(added.worktreeCwd).toBeUndefined();
+      expect(added.cowId).toBeUndefined();
+      expect(result.tabs[0].focusedId).toBe(added.id);
+      expect(workspaceTabCwd(result.tabs[0], result.sessions)).toBe("/repo");
+      expect(JSON.stringify({ source, tab })).toBe(before);
+    },
+  );
 });

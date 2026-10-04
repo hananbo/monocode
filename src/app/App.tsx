@@ -961,6 +961,7 @@ function Workspace({
   const [sessionDeleteDialog, setSessionDeleteDialog] = useState<{
     title: string;
     unusedWorktree: string;
+    cow?: boolean;
     resolve: (choice: SessionDeleteChoice) => void;
   }>();
   const switchingWorktrees = useRef(new Map<string, string>());
@@ -1594,14 +1595,6 @@ function Workspace({
       });
       if (!result) return;
 
-      const added = result.sessions.find((session) => session.id === result.sessionId);
-      const source = added && sessionsRef.current.find((session) => session.cowId && sameProjectPath(sessionWorkCwd(session), sessionWorkCwd(added)));
-      if (added && source) {
-        added.cwd = source.cwd;
-        added.worktreeCwd = undefined;
-        added.workspaceMode = "cow";
-        added.cowSourceCwd = sessionWorkCwd(source);
-      }
       sessionsRef.current = result.sessions;
       tabsRef.current = result.tabs;
       setSessions(result.sessions);
@@ -3988,8 +3981,11 @@ function Workspace({
         return null;
       }
       if (restored.cowId) {
-        const copies = await listCowWorkspaces(restored.cwd).catch(() => []);
-        if (!copies.some((copy) => copy.id === restored.cowId && copy.sessionId === restored.id && sameProjectPath(copy.path, sessionWorkCwd(restored)))) restored.worktreeRemoved = true;
+        const copies = await listCowWorkspaces(restored.cwd).catch(() => undefined);
+        if (copies && !copies.some((copy) =>
+          copy.id === restored.cowId && copy.sessionId === restored.id &&
+          sameProjectPath(copy.path, sessionWorkCwd(restored))))
+          restored.worktreeRemoved = true;
       }
       loadedSessionCache.current.delete(sessionId);
       const appeared = sessionsRef.current.find(
@@ -4667,8 +4663,19 @@ function Workspace({
         if (seed?.cowId && seed.worktreeCwd) {
           try {
             const copies = await listCowWorkspaces(seed.cwd);
-            if (copies.some((copy) => copy.id === seed.cowId && sameProjectPath(copy.path, seed.worktreeCwd!))) unusedWorktree = seed.worktreeCwd;
-          } catch { /* Failed lookup must never offer cleanup. */ }
+            const copy = copies.find((entry) =>
+              entry.id === seed.cowId && sameProjectPath(entry.path, seed.worktreeCwd!),
+            );
+            if (
+              copy && copy.sessionId === sessionId &&
+              worktreeSessionIds(
+                { path: copy.path, sessionIds: copy.sessionIds ?? [] },
+                sessionsRef.current,
+              ).every((id) => id === sessionId)
+            ) unusedWorktree = copy.path;
+          } catch {
+            // A failed lookup must never offer filesystem cleanup.
+          }
         } else if (seed?.worktreeCwd) {
           try {
             const { worktrees } = await listWorktrees(seed.cwd);
@@ -4693,7 +4700,12 @@ function Workspace({
           deleteConfirmationPending.current = false;
         } else {
           const choice = await new Promise<SessionDeleteChoice>((resolve) => {
-            setSessionDeleteDialog({ title: label, unusedWorktree, resolve });
+            setSessionDeleteDialog({
+              title: label,
+              unusedWorktree,
+              cow: !!seed?.cowId,
+              resolve,
+            });
           });
           deleteConfirmationPending.current = false;
           if (!choice.confirmed) {
@@ -4840,10 +4852,7 @@ function Workspace({
         const removed = await remover.remove(sessionId);
         if (removed && deleteWorktreePath && seed) {
           try {
-            if (seed.cowId) {
-              checkOpenWorktreeFiles(deleteWorktreePath);
-              await removeCowWorkspace(seed.cwd, seed.cowId, false);
-            } else await onRemoveWorktree(seed.cwd, deleteWorktreePath, false);
+            await onRemoveWorktree(seed.cwd, deleteWorktreePath, false);
           } catch (error) {
             void message(
               `The session was deleted. Its isolated workspace was kept.\n\n${String(error)}\n\nYou can manage it in Settings → Work Isolation.`,
@@ -11414,6 +11423,7 @@ function Workspace({
             <DeleteSessionDialog
               title={sessionDeleteDialog.title}
               unusedWorktree={sessionDeleteDialog.unusedWorktree}
+              cow={sessionDeleteDialog.cow}
               onClose={(choice) => {
                 sessionDeleteDialog.resolve(choice);
                 setSessionDeleteDialog(undefined);

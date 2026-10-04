@@ -1,10 +1,11 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   chmodSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -16,6 +17,105 @@ import { HostEngine } from "./engine";
 import { WorkspaceCommands } from "./workspace-commands";
 import { hostCow, resolveHostWorkspaceAsync, type HostCow } from "./cow";
 import type { HostProvider } from "./providers";
+
+it("keeps healthy project file and Git RPCs usable after another project disappears", async () => {
+  const folder = realpathSync.native(mkdtempSync(join(tmpdir(), "monocode-cow-roots-")));
+  const healthy = join(folder, "healthy");
+  const missing = join(folder, "missing");
+  mkdirSync(healthy);
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: healthy });
+  execFileSync("git", ["config", "user.name", "Test"], { cwd: healthy });
+  execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: healthy });
+  writeFileSync(join(healthy, "file.txt"), "healthy\n");
+  execFileSync("git", ["add", "."], { cwd: healthy });
+  execFileSync("git", ["commit", "-qm", "base"], { cwd: healthy });
+  mkdirSync(missing);
+  const store = new HostStore(join(folder, "host.db"));
+  store.addProject(missing, "Missing");
+  store.addProject(healthy, "Healthy");
+  rmSync(missing, { recursive: true });
+  const commands = new WorkspaceCommands(store, async (_id, action) => action());
+  const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    expect(await commands.run("read_text_file", { path: join(healthy, "file.txt") })).toBe("healthy\n");
+    await commands.run("write_text_file", { path: join(healthy, "file.txt"), original: "healthy\n", content: "edited\n" });
+    expect(await commands.run("git_diff_index", { cwd: healthy })).toMatchObject({ branch: "main" });
+    const outside = join(folder, "unowned");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "file.txt"), "unowned\n");
+    await expect(commands.run("read_text_file", { path: join(outside, "file.txt") })).rejects.toThrow(/outside/);
+  } finally {
+    error.mockRestore();
+    store.close();
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+it("authorizes native copies asynchronously while another helper holds the registry lock", async () => {
+  const folder = realpathSync.native(mkdtempSync(join(tmpdir(), "monocode-cow-async-")));
+  const cwd = join(folder, "project");
+  mkdirSync(cwd);
+  const git = (...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
+  git("init", "-q", "-b", "main");
+  git("config", "user.name", "Test");
+  git("config", "user.email", "test@example.invalid");
+  writeFileSync(join(cwd, "file.txt"), "base\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  const store = new HostStore(join(folder, "host.db"));
+  const project = store.addProject(cwd, "Project");
+  const provider: HostProvider = {
+    send: async () => {}, cancel: async () => {}, stop: async () => {},
+    bind: () => {}, approve: () => {}, answer: () => {},
+  };
+  const engine = new HostEngine(store, { codex: provider });
+  let lock: ReturnType<typeof spawn> | undefined;
+  let listing: Promise<unknown> | undefined;
+  try {
+    const capability = await hostCow<{ supported: boolean }>(store, "cow_capability", { cwd });
+    if (!capability.supported) {
+      expect(process.env.MONOCODE_REQUIRE_COW).not.toBe("1");
+      return;
+    }
+    const copy = await hostCow<HostCow>(store, "cow_create", { cwd, sessionId: "async-owner" });
+    lock = spawn("python3", ["-c", "import fcntl,sys; f=open(sys.argv[1],'r+'); fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); sys.stdin.read()", join(store.isolationDir, ".lock")]);
+    await new Promise<void>((accept, reject) => {
+      lock!.stdout!.once("data", () => accept());
+      lock!.once("error", reject);
+      lock!.once("exit", () => reject(new Error("Lock holder exited before acquiring the lock")));
+    });
+    listing = hostCow(store, "cow_list", { cwd });
+    let listingSettled = false;
+    void listing.then(() => { listingSettled = true; }, () => { listingSettled = true; });
+    const transaction = vi.spyOn(store, "transaction");
+    const creating = engine.commandAsync({ type: "create", commandId: "async-create", projectId: project.id,
+      harness: "codex", model: "codex:test", runtimeMode: "supervised", cowId: copy.id });
+    expect(transaction).not.toHaveBeenCalled();
+    let heartbeat = false;
+    await new Promise<void>((accept) => setImmediate(() => { heartbeat = true; accept(); }));
+    expect(heartbeat).toBe(true);
+    expect(await creating).toMatchObject({ sessionId: "async-owner" });
+    expect(listingSettled).toBe(false);
+    transaction.mockRestore();
+    const commands = new WorkspaceCommands(store, async (_id, action) => action());
+    expect(await commands.run("read_text_file", { path: join(copy.path, "file.txt") })).toBe("base\n");
+    renameSync(copy.path, `${copy.path}-original`);
+    mkdirSync(copy.path);
+    mkdirSync(join(copy.path, ".git"));
+    writeFileSync(join(copy.path, "file.txt"), "replacement\n");
+    await expect(commands.run("read_text_file", { path: join(copy.path, "file.txt") })).rejects.toThrow(/ownership changed/);
+    await expect(engine.commandAsync({ type: "send", commandId: "replaced-send", sessionId: "async-owner", text: "work" })).rejects.toThrow(/replaced|ownership|unavailable/);
+  } finally {
+    if (lock) {
+      lock.stdin?.end();
+      await new Promise<void>((accept) => lock!.exitCode !== null ? accept() : lock!.once("close", () => accept()));
+    }
+    await listing?.catch(() => {});
+    await engine.close();
+    store.close();
+    rmSync(folder, { recursive: true, force: true });
+  }
+}, 30_000);
 
 it("keeps ordinary projects usable when one legacy copy cannot upgrade", async () => {
   const folder = mkdtempSync(join(tmpdir(), "monocode-cow-upgrade-"));
@@ -164,15 +264,15 @@ it("runs providers in native clones, integrates session edits, and guards owners
       runtimeMode: "supervised" as const,
       cowId: copy.id,
     };
-    expect(engine.command(create).sessionId).toBe("owner");
-    expect(engine.command(create).sessionId).toBe("owner");
-    expect(() => engine.command({ ...create, commandId: "duplicate" })).toThrow(
+    expect((await engine.commandAsync(create)).sessionId).toBe("owner");
+    expect((await engine.commandAsync(create)).sessionId).toBe("owner");
+    await expect(engine.commandAsync({ ...create, commandId: "duplicate" })).rejects.toThrow(
       /already belongs/,
     );
     await expect(
       resolveHostWorkspaceAsync(store, cwd, folder),
     ).rejects.toThrow();
-    engine.command({
+    await engine.commandAsync({
       type: "send",
       commandId: "edit",
       sessionId: "owner",

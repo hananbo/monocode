@@ -30,6 +30,119 @@ pub struct Workspace {
     git_config_version: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     removal_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    initial_refs: Option<BTreeMap<String, String>>,
+}
+impl Workspace {
+    fn view(&self) -> Result<Value> {
+        let git_identity = identity(&Path::new(&self.path).join(".git"))?;
+        let mut value = json!({
+            "id": self.id, "path": self.path, "sourceCwd": self.source_cwd,
+            "projectCwd": self.project_cwd, "sessionId": self.session_id,
+            "branch": self.branch, "head": self.head,
+            "rootIdentity": [self.identity.0.to_string(), self.identity.1.to_string()],
+            "gitIdentity": [git_identity.0.to_string(), git_identity.1.to_string()]
+        });
+        if let Some(dirty) = self.dirty {
+            value["dirty"] = json!(dirty);
+        }
+        if let Some(unpushed) = self.unpushed {
+            value["unpushed"] = json!(unpushed);
+        }
+        Ok(value)
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreationIntent {
+    id: String,
+    path: PathBuf,
+    project_cwd: PathBuf,
+    identity: Option<(u64, u64)>,
+    baseline_identity: Option<(u64, u64)>,
+    removal_path: Option<PathBuf>,
+}
+fn cleanup_creation(store: &Path, intent: &mut CreationIntent) -> Result<()> {
+    id_valid(&intent.id)?;
+    let parent = intent.project_cwd.with_file_name(format!(
+        "{}-cow",
+        intent
+            .project_cwd
+            .file_name()
+            .ok_or("Invalid creation project")?
+            .to_string_lossy()
+    ));
+    if intent.path != parent.join(&intent.id) {
+        return Err("Invalid pending creation path".into());
+    }
+    identity(&parent)?;
+    let record = store.join(&intent.id);
+    match fs::symlink_metadata(record.join("workspace.json")) {
+        Ok(_) => {
+            let w: Workspace = read_json(&record.join("workspace.json"))?;
+            if w.id != intent.id
+                || Path::new(&w.path) != intent.path
+                || Some(w.identity) != intent.identity
+            {
+                return Err("Pending creation record was replaced".into());
+            }
+            // Registration completed before interruption. Leave the usable copy alone.
+            return fs::remove_file(record.join("creation.json")).map_err(err);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(err(error)),
+    }
+    match fs::symlink_metadata(&intent.path) {
+        Ok(_) => {
+            if Some(identity(&intent.path)?) != intent.identity {
+                return Err("Pending creation root was replaced; retained for inspection".into());
+            }
+            let tombstone = parent.join(format!("remove-{}", uuid::Uuid::new_v4()));
+            intent.removal_path = Some(tombstone.clone());
+            write_json(&record.join("creation.json"), intent)?;
+            fs::rename(&intent.path, &tombstone).map_err(err)?;
+            if Some(identity(&tombstone)?) != intent.identity {
+                let _ = fs::rename(&tombstone, &intent.path);
+                return Err("Pending creation root changed during cleanup".into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(err(error)),
+    }
+    if let Some(tombstone) = &intent.removal_path {
+        if tombstone.parent() != Some(parent.as_path())
+            || !tombstone
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("remove-"))
+                .is_some_and(|id| id_valid(id).is_ok())
+        {
+            return Err("Invalid pending creation removal path".into());
+        }
+        match fs::symlink_metadata(tombstone) {
+            Ok(_) => {
+                if Some(identity(tombstone)?) != intent.identity {
+                    return Err("Pending creation cleanup root was replaced".into());
+                }
+                fs::remove_dir_all(tombstone).map_err(err)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(err(error)),
+        }
+    }
+    let baseline = parent.join(".baselines").join(&intent.id);
+    match fs::symlink_metadata(&baseline) {
+        Ok(_) => {
+            identity(&parent.join(".baselines"))?;
+            if Some(identity(&baseline)?) != intent.baseline_identity {
+                return Err("Pending creation baseline was replaced".into());
+            }
+            fs::remove_dir_all(baseline).map_err(err)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(err(error)),
+    }
+    fs::remove_dir_all(record).map_err(err)
 }
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -88,7 +201,12 @@ fn write_json(p: &Path, v: &impl Serialize) -> Result<()> {
         .map_err(err)?;
     serde_json::to_writer(&mut f, v).map_err(err)?;
     f.sync_all().map_err(err)?;
-    fs::rename(temp, p).map_err(err)
+    fs::rename(temp, p).map_err(err)?;
+    // Persist the rename too, not just the temporary file's contents.
+    File::open(p.parent().ok_or("Missing JSON parent")?)
+        .map_err(err)?
+        .sync_all()
+        .map_err(err)
 }
 fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
     let parent = p.parent().ok_or("Missing registry parent")?;
@@ -867,33 +985,68 @@ fn tree(
         return Err("Cannot initialize snapshot index".into());
     }
     let result = (|| {
-        let mut entries = Vec::new();
-        for p in eligible.difference(excluded) {
-            let Some((mode, data)) = blob(root, p)? else {
-                continue;
-            };
-            let oid = if mode == "120000" {
-                String::from_utf8(git(
-                    objects,
-                    &["hash-object", "-w", "--stdin"],
-                    Some(data.as_bytes()),
-                )?)
-                .map_err(err)?
-                .trim()
-                .to_string()
-            } else {
-                let mut c = git_base(objects);
-                c.args(["hash-object", "-w", "--stdin"])
-                    .stdin(Stdio::from(open_regular(root, p)?));
-                let out = c.output().map_err(err)?;
-                if !out.status.success() {
-                    return Err("Cannot hash file".into());
+        // One raw blob import process handles all files and symlinks. Paths never
+        // reach Git: regular files are opened through the existing no-follow walk.
+        let marks = objects.join(format!("marks-{}", uuid::Uuid::new_v4()));
+        let mut importer = git_base(objects)
+            .args(["fast-import", "--quiet", "--done"])
+            .arg(format!("--export-marks={}", marks.display()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(err)?;
+        let captured: Result<Vec<(String, &String)>> = (|| {
+            let mut input = importer.stdin.take().ok_or("Missing blob input")?;
+            let mut captured = Vec::new();
+            for p in eligible.difference(excluded) {
+                let Some((mode, data)) = blob(root, p)? else {
+                    continue;
+                };
+                let mark = captured.len() + 1;
+                if mode == "120000" {
+                    write!(input, "blob\nmark :{mark}\ndata {}\n", data.len()).map_err(err)?;
+                    input.write_all(data.as_bytes()).map_err(err)?;
+                } else {
+                    let mut file = open_regular(root, p)?;
+                    let before = file.metadata().map_err(err)?;
+                    write!(input, "blob\nmark :{mark}\ndata {}\n", before.len()).map_err(err)?;
+                    let copied = std::io::copy(
+                        &mut std::io::Read::by_ref(&mut file).take(before.len()),
+                        &mut input,
+                    )
+                    .map_err(err)?;
+                    if copied != before.len()
+                        || file.metadata().map_err(err)?.modified().map_err(err)?
+                            != before.modified().map_err(err)?
+                    {
+                        return Err("File changed during snapshot capture; retry".into());
+                    }
                 }
-                String::from_utf8(out.stdout)
-                    .map_err(err)?
-                    .trim()
-                    .to_string()
-            };
+                input.write_all(b"\n").map_err(err)?;
+                captured.push((mode, p));
+            }
+            input.write_all(b"done\n").map_err(err)?;
+            Ok(captured)
+        })();
+        // Closing stdin lets a failed import terminate too; reap before returning.
+        let imported = importer.wait_with_output().map_err(err)?;
+        let marks_data = fs::read_to_string(&marks).map_err(err);
+        let _ = fs::remove_file(&marks);
+        let captured: Vec<(String, &String)> = captured?;
+        if !imported.status.success() {
+            return Err(String::from_utf8_lossy(&imported.stderr).into_owned());
+        }
+        let mut oids = BTreeMap::new();
+        for line in marks_data?.lines() {
+            let (mark, oid) = line.split_once(' ').ok_or("Invalid blob import marks")?;
+            oids.insert(mark.to_string(), oid.to_string());
+        }
+        let mut entries = Vec::new();
+        for (index, (mode, p)) in captured.iter().enumerate() {
+            let oid = oids
+                .get(&format!(":{}", index + 1))
+                .ok_or("Missing imported blob")?;
             entries.extend_from_slice(format!("{mode} {oid}\t{p}\0").as_bytes());
         }
         let mut child = git_base(objects)
@@ -943,48 +1096,73 @@ fn file_digest(p: &Path) -> Result<String> {
     }
     Ok(format!("{:x}", h.finalize()))
 }
-fn fingerprint(root: &Path) -> Result<BTreeMap<String, String>> {
-    fn walk(root: &Path, p: &Path, out: &mut BTreeMap<String, String>) -> Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+struct Fingerprint {
+    identity: (u64, u64),
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    mode: u32,
+    link: Option<String>,
+}
+#[cfg(unix)]
+fn fingerprint(root: &Path) -> Result<BTreeMap<String, Fingerprint>> {
+    use std::os::unix::fs::MetadataExt;
+    fn walk(root: &Path, p: &Path, out: &mut BTreeMap<String, Fingerprint>) -> Result<()> {
+        let dir = open_dir(p)?;
+        let directory_identity = (
+            dir.metadata().map_err(err)?.dev(),
+            dir.metadata().map_err(err)?.ino(),
+        );
         for e in fs::read_dir(p).map_err(err)? {
             let e = e.map_err(err)?;
             if p == root && e.file_name() == ".git" {
                 continue;
             }
             let path = e.path();
-            let m = fs::symlink_metadata(&path).map_err(err)?;
             let rel = path
                 .strip_prefix(root)
                 .map_err(err)?
                 .to_str()
                 .ok_or("Non-UTF-8 path")?
                 .to_string();
+            checked_file(root, &rel)?;
+            let mut m = fs::symlink_metadata(&path).map_err(err)?;
             if m.is_dir() {
                 walk(root, &path, out)?;
+                continue;
+            }
+            let link = if m.file_type().is_symlink() {
+                Some(
+                    blob(root, &rel)?
+                        .ok_or("Symlink disappeared during capture")?
+                        .1,
+                )
             } else if m.is_file() {
-                let mut h = Sha256::new();
-                let mut f = open_regular(root, &rel)?;
-                let mut buf = [0; 65536];
-                loop {
-                    let n = f.read(&mut buf).map_err(err)?;
-                    if n == 0 {
-                        break;
-                    }
-                    h.update(&buf[..n]);
+                let file = open_regular(root, &rel)?;
+                let opened = file.metadata().map_err(err)?;
+                if (m.dev(), m.ino()) != (opened.dev(), opened.ino()) {
+                    return Err("Source changed during metadata capture; retry".into());
                 }
-                #[cfg(unix)]
-                let executable = {
-                    use std::os::unix::fs::PermissionsExt;
-                    m.permissions().mode() & 0o111
-                };
-                #[cfg(not(unix))]
-                let executable = 0;
-                out.insert(rel, format!("{executable}:{:x}", h.finalize()));
-            } else if m.file_type().is_symlink() {
-                let (_, link) = blob(root, &rel)?.ok_or("Symlink disappeared during capture")?;
-                out.insert(rel, format!("link:{link}"));
+                m = opened;
+                None
             } else {
                 return Err("Unsupported special file".into());
-            }
+            };
+            out.insert(
+                rel,
+                Fingerprint {
+                    identity: (m.dev(), m.ino()),
+                    size: if link.is_some() { 0 } else { m.len() },
+                    modified: (m.mtime(), m.mtime_nsec()),
+                    changed: (m.ctime(), m.ctime_nsec()),
+                    mode: m.mode() & 0o777,
+                    link,
+                },
+            );
+        }
+        if identity(p)? != directory_identity {
+            return Err("Source directory changed during metadata capture; retry".into());
         }
         Ok(())
     }
@@ -992,6 +1170,42 @@ fn fingerprint(root: &Path) -> Result<BTreeMap<String, String>> {
     walk(root, root, &mut out)?;
     Ok(out)
 }
+#[cfg(not(unix))]
+fn fingerprint(_: &Path) -> Result<BTreeMap<String, Fingerprint>> {
+    Err(UNSUPPORTED_FILESYSTEM.into())
+}
+fn clone_matches(
+    before: &BTreeMap<String, Fingerprint>,
+    clone: &BTreeMap<String, Fingerprint>,
+) -> bool {
+    before.len() == clone.len()
+        && before.iter().all(|(path, original)| {
+            clone.get(path).is_some_and(|copy| {
+                original.size == copy.size
+                    && original.mode == copy.mode
+                    && original.link == copy.link
+                    && (original.link.is_some() || original.modified == copy.modified)
+            })
+        })
+}
+fn local_refs(root: &Path) -> Result<BTreeMap<String, String>> {
+    text(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/tags",
+        ],
+    )?
+    .lines()
+    .map(|line| {
+        let (name, oid) = line.split_once(' ').ok_or("Invalid Git reference")?;
+        Ok((name.to_string(), oid.to_string()))
+    })
+    .collect()
+}
+
 fn load(store: &Path, cwd: &Path, id: &str) -> Result<Workspace> {
     id_valid(id)?;
     let mut w: Workspace = read_json(&store.join(id).join("workspace.json"))?;
@@ -1092,6 +1306,23 @@ fn create(
     }
     let source_head = text(&source, &["rev-parse", "HEAD"])?;
     let head = resolve_base(&source, base.unwrap_or("HEAD"))?;
+    if head != source_head
+        && config_reader(&source)
+            .args([
+                "config",
+                "--includes",
+                "--name-only",
+                "--get-regexp",
+                "^filter\\.",
+            ])
+            .output()
+            .map_err(err)?
+            .status
+            .success()
+    {
+        return Err("Choose the current HEAD for copy-on-write when Git filters are configured; another base would require executing those filters. Use a worktree for that base.".into());
+    }
+    let initial_refs = local_refs(&source)?;
     let token = session
         .chars()
         .filter(char::is_ascii_alphanumeric)
@@ -1133,7 +1364,20 @@ fn create(
     let path = parent.join(&id);
     let record = store.join(&id);
     private_dir(&record)?;
+    let mut intent = CreationIntent {
+        id: id.clone(),
+        path: path.clone(),
+        project_cwd: project.clone(),
+        identity: None,
+        baseline_identity: None,
+        removal_path: None,
+    };
+    write_json(&record.join("creation.json"), &intent)?;
     let result = (|| {
+        fs::create_dir(&path).map_err(err)?;
+        private_dir(&path)?;
+        intent.identity = Some(identity(&path)?);
+        write_json(&record.join("creation.json"), &intent)?;
         clone_tree(&source, &path, true)?;
         private_git(
             &source,
@@ -1142,9 +1386,10 @@ fn create(
             branch.as_deref().unwrap_or("cow"),
         )?;
         if before != fingerprint(&source)?
-            || before != fingerprint(&path)?
+            || !clone_matches(&before, &fingerprint(&path)?)
             || text(&source, &["rev-parse", "HEAD"])? != source_head
             || paths(&source)? != eligible
+            || local_refs(&source)? != initial_refs
         {
             return Err("Source changed while cloning; retry".into());
         }
@@ -1163,6 +1408,10 @@ fn create(
         }
         let eligible = paths(&path)?;
         let base = snapshot_directory(store, &path, &id)?;
+        fs::create_dir(&base).map_err(err)?;
+        private_dir(&base)?;
+        intent.baseline_identity = Some(identity(&base)?);
+        write_json(&record.join("creation.json"), &intent)?;
         init_repo(
             &base,
             &text(&source, &["rev-parse", "--show-object-format"])?,
@@ -1183,16 +1432,16 @@ fn create(
             identity: identity(&path)?,
             git_config_version: 2,
             removal_path: None,
+            initial_refs: Some(initial_refs),
         };
         write_json(&record.join("workspace.json"), &w)?;
+        let _ = fs::remove_file(record.join("creation.json"));
         Ok(w)
     })();
     if result.is_err() {
-        let _ = fs::remove_dir_all(&path);
-        if let Ok(snapshot) = snapshot_directory(store, &path, &id) {
-            let _ = fs::remove_dir_all(snapshot);
+        if let Err(error) = cleanup_creation(store, &mut intent) {
+            eprintln!("Pending copy creation cleanup will retry: {error}");
         }
-        let _ = fs::remove_dir_all(record);
     }
     result
 }
@@ -1557,6 +1806,12 @@ fn preserve_history(w: &Workspace) -> Result<()> {
     }
     for line in refs.lines().filter(|line| !line.is_empty()) {
         let (reference, oid) = line.split_once(' ').ok_or("Invalid Git reference")?;
+        if w.initial_refs
+            .as_ref()
+            .is_some_and(|refs| refs.get(reference).map(String::as_str) == Some(oid))
+        {
+            continue; // An inherited ref that this copy never changed is not session history.
+        }
         let existing = text(&source, &["rev-parse", "--verify", reference]).ok();
         if existing.as_deref() == Some(oid) {
             continue;
@@ -1570,7 +1825,10 @@ fn preserve_history(w: &Workspace) -> Result<()> {
         }
         let destination = if reference == "HEAD" {
             format!("refs/heads/mc/kept-{}/detached", w.id)
-        } else if existing.is_some() {
+        } else if existing.is_some()
+            || (w.initial_refs.is_none()
+                && reference.strip_prefix("refs/heads/") != w.branch.as_deref())
+        {
             let (namespace, name) = if let Some(name) = reference.strip_prefix("refs/heads/") {
                 ("refs/heads", name)
             } else {
@@ -1743,8 +2001,83 @@ fn remove(store: &Path, w: &Workspace, force: bool) -> Result<Value> {
     }
     Ok(Value::Null)
 }
+// Authorization reads are independent of Git status and the mutation lock.
+// Records publish atomically only after creation; root identities are checked
+// again by callers before use, and records for pending removals never authorize.
+fn owned_metadata(store: &Path, cwd: &Path, id: Option<&str>, path: Option<&str>) -> Result<Value> {
+    let cwd = canonical(cwd)?;
+    let valid = |w: &Workspace| {
+        w.git_config_version >= 2
+            && w.removal_path.is_none()
+            && identity(Path::new(&w.path)).is_ok_and(|identity| identity == w.identity)
+            && identity(&Path::new(&w.path).join(".git")).is_ok()
+    };
+    if let Some(id) = id {
+        id_valid(id)?;
+        let w: Workspace = read_json(&store.join(id).join("workspace.json"))?;
+        if w.id != id
+            || !valid(&w)
+            || ![&w.project_cwd, &w.source_cwd, &w.path]
+                .iter()
+                .any(|path| Path::new(path) == cwd)
+        {
+            return Err(
+                "Copy-on-write workspace is unavailable or belongs to another project".into(),
+            );
+        }
+        return w.view();
+    }
+    let registered = fs::read_dir(store)
+        .map_err(err)?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let w: Workspace = read_json(&entry.path().join("workspace.json")).ok()?;
+            (entry.file_name().to_str() == Some(w.id.as_str()) && valid(&w)).then_some(w)
+        })
+        .collect::<Vec<_>>();
+    let project = registered
+        .iter()
+        .find(|w| Path::new(&w.path) == cwd || Path::new(&w.source_cwd) == cwd)
+        .map(|w| Path::new(&w.project_cwd))
+        .unwrap_or(&cwd);
+    if let Some(path) = path {
+        return registered
+            .iter()
+            .find(|w| Path::new(&w.project_cwd) == project && Path::new(&w.path) == Path::new(path))
+            .map(Workspace::view)
+            .unwrap_or(Ok(Value::Null));
+    }
+    registered
+        .iter()
+        .filter(|w| Path::new(&w.project_cwd) == project)
+        .map(Workspace::view)
+        .collect::<Result<Vec<_>>>()
+        .map(Value::Array)
+}
 pub fn dispatch(store: &Path, request: Value) -> Result<Value> {
     private_dir(store)?;
+    let command = request["command"]
+        .as_str()
+        .ok_or("Missing isolation command")?;
+    let a = &request["args"];
+    let string = |key: &str| a[key].as_str().ok_or_else(|| format!("Missing {key}"));
+    let cwd = Path::new(string("cwd")?);
+    if !cfg!(target_os = "macos") {
+        return match command {
+            "cow_capability" => Ok(json!({"supported":false,"reason":UNSUPPORTED_FILESYSTEM})),
+            "cow_list" | "cow_roots" => Ok(json!([])),
+            _ => Err(UNSUPPORTED_FILESYSTEM.into()),
+        };
+    }
+    if command == "cow_roots" {
+        return owned_metadata(store, cwd, None, None);
+    }
+    if command == "cow_owner" {
+        if a["cowId"].as_str().is_none() && a["path"].as_str().is_none() {
+            return Err("Specify an isolation ID or owned path".into());
+        }
+        return owned_metadata(store, cwd, a["cowId"].as_str(), a["path"].as_str());
+    }
     // ponytail: serialize registry operations; per-workspace locks if large captures contend.
     #[cfg(unix)]
     let _lock = {
@@ -1764,21 +2097,15 @@ pub fn dispatch(store: &Path, request: Value) -> Result<Value> {
         }
         lock
     };
-    let command = request["command"]
-        .as_str()
-        .ok_or("Missing isolation command")?;
-    let a = &request["args"];
-    let string = |key: &str| a[key].as_str().ok_or_else(|| format!("Missing {key}"));
-    let cwd = Path::new(string("cwd")?);
-    if !cfg!(target_os = "macos") {
-        return match command {
-            "cow_capability" => Ok(json!({"supported":false,"reason":UNSUPPORTED_FILESYSTEM})),
-            "cow_list" => Ok(json!([])),
-            _ => Err(UNSUPPORTED_FILESYSTEM.into()),
-        };
-    }
     for entry in fs::read_dir(store).map_err(err)? {
         let entry = entry.map_err(err)?;
+        if let Ok(mut intent) = read_json::<CreationIntent>(&entry.path().join("creation.json")) {
+            if entry.file_name().to_str() == Some(intent.id.as_str()) {
+                if let Err(error) = cleanup_creation(store, &mut intent) {
+                    eprintln!("Pending copy creation cleanup will retry: {error}");
+                }
+            }
+        }
         if let Ok(w) = read_json::<Workspace>(&entry.path().join("workspace.json")) {
             if w.removal_path.is_some() {
                 if let Err(error) = cleanup_removed(store, &w) {
@@ -1791,14 +2118,14 @@ pub fn dispatch(store: &Path, request: Value) -> Result<Value> {
         return Ok(capability(cwd));
     }
     if command == "cow_create" {
-        return serde_json::to_value(create(
+        return create(
             store,
             cwd,
             string("sessionId")?,
             a["projectCwd"].as_str().map(Path::new),
             a["base"].as_str(),
-        )?)
-        .map_err(err);
+        )?
+        .view();
     }
     if command == "cow_list" {
         let cwd = canonical(cwd)?;
@@ -1833,10 +2160,7 @@ pub fn dispatch(store: &Path, request: Value) -> Result<Value> {
                     w.head = text(Path::new(&w.path), &["rev-parse", "HEAD"]).unwrap_or_default();
                     w.dirty = git_dirty(Path::new(&w.path)).ok();
                     w.unpushed = unpreserved_commits(&w).ok();
-                    let mut value = serde_json::to_value(&w).map_err(err)?;
-                    value["rootIdentity"] =
-                        json!([w.identity.0.to_string(), w.identity.1.to_string()]);
-                    Ok(value)
+                    w.view()
                 })
                 .collect::<Result<Vec<_>>>()?,
         )
@@ -1932,6 +2256,329 @@ mod tests {
         .contains("APFS on macOS"));
         assert!(!source.with_file_name("project-cow").exists());
         assert_eq!(text(&source, &["status", "--porcelain"]).unwrap(), "");
+    }
+    #[test]
+    fn public_metadata_is_compact_owned_and_independent_of_the_mutation_lock() {
+        let t = Temp::new();
+        let source = t.repo();
+        if !native_supported(&source) {
+            return;
+        }
+        let store = t.0.join("registry");
+        private_dir(&store).unwrap();
+        let mut w = create(&store, &source, "metadata-session", None, None).unwrap();
+        w.excluded
+            .extend((0..5000).map(|i| format!("deps/private-{i}")));
+        write_json(&store.join(&w.id).join("workspace.json"), &w).unwrap();
+        let created = dispatch(
+            &store,
+            json!({"command":"cow_create","args":{"cwd":source,"sessionId":"metadata-session"}}),
+        )
+        .unwrap();
+        assert!(serde_json::to_vec(&created).unwrap().len() < 2000);
+        for field in [
+            "excluded",
+            "baseline",
+            "identity",
+            "initialRefs",
+            "removalPath",
+            "gitConfigVersion",
+        ] {
+            assert!(created.get(field).is_none(), "Internal {field} was exposed");
+        }
+        let listed = dispatch(&store, json!({"command":"cow_list","args":{"cwd":source}})).unwrap();
+        assert!(listed[0].get("excluded").is_none());
+        let owner_request = json!({"command":"cow_owner","args":{"cwd":source,"cowId":w.id}});
+        let owner = dispatch(&store, owner_request.clone()).unwrap();
+        assert_eq!(owner["rootIdentity"][0], w.identity.0.to_string());
+        assert!(owner["gitIdentity"][0].is_string());
+        assert!(dispatch(
+            &store,
+            json!({"command":"cow_owner","args":{"cwd":t.0,"cowId":w.id}})
+        )
+        .is_err());
+        assert!(dispatch(&store, json!({"command":"cow_owner","args":{"cwd":source,"cowId":uuid::Uuid::new_v4().to_string()}})).is_err());
+        assert_eq!(
+            dispatch(
+                &store,
+                json!({"command":"cow_owner","args":{"cwd":source,"path":source}})
+            )
+            .unwrap(),
+            Value::Null
+        );
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let lock = File::open(store.join(".lock")).unwrap();
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker_store = store.clone();
+            let worker_source = source.clone();
+            let worker = std::thread::spawn(move || {
+                let roots = dispatch(
+                    &worker_store,
+                    json!({"command":"cow_roots","args":{"cwd":worker_source}}),
+                );
+                let owner = dispatch(&worker_store, owner_request);
+                sender.send((roots, owner)).unwrap();
+            });
+            let result = receiver.recv_timeout(std::time::Duration::from_secs(3));
+            drop(lock);
+            worker.join().unwrap();
+            let (roots, owner) =
+                result.expect("Authorization waited for an unrelated mutation lock");
+            assert_eq!(roots.unwrap().as_array().unwrap().len(), 1);
+            assert_eq!(owner.unwrap()["id"], w.id);
+        }
+        w.git_config_version = 1;
+        write_json(&store.join(&w.id).join("workspace.json"), &w).unwrap();
+        assert!(dispatch(
+            &store,
+            json!({"command":"cow_owner","args":{"cwd":source,"cowId":w.id}})
+        )
+        .is_err());
+        assert_eq!(
+            dispatch(&store, json!({"command":"cow_roots","args":{"cwd":source}})).unwrap(),
+            json!([])
+        );
+        w.git_config_version = 2;
+        write_json(&store.join(&w.id).join("workspace.json"), &w).unwrap();
+        let saved = Path::new(&w.path).with_file_name("saved-copy");
+        fs::rename(&w.path, &saved).unwrap();
+        private_dir(Path::new(&w.path)).unwrap();
+        init_repo(Path::new(&w.path), "sha1").unwrap();
+        assert!(dispatch(
+            &store,
+            json!({"command":"cow_owner","args":{"cwd":source,"cowId":w.id}})
+        )
+        .is_err());
+        assert_eq!(
+            dispatch(&store, json!({"command":"cow_roots","args":{"cwd":source}})).unwrap(),
+            json!([])
+        );
+    }
+    #[test]
+    fn cleanup_preserves_session_refs_without_restoring_untouched_source_refs() {
+        let t = Temp::new();
+        let source = t.repo();
+        if !native_supported(&source) {
+            return;
+        }
+        let store = t.0.join("registry");
+        private_dir(&store).unwrap();
+        text(&source, &["branch", "deleted-in-source"]).unwrap();
+        text(&source, &["tag", "deleted-tag"]).unwrap();
+        let source_branch = text(&source, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        let w = create(&store, &source, "ref-session", None, None).unwrap();
+        text(&source, &["branch", "-D", "deleted-in-source"]).unwrap();
+        text(&source, &["tag", "-d", "deleted-tag"]).unwrap();
+        fs::write(source.join("app.txt"), "rebased source\n").unwrap();
+        text(&source, &["add", "."]).unwrap();
+        text(&source, &["commit", "--amend", "-m", "rewritten source"]).unwrap();
+        fs::write(Path::new(&w.path).join("new.txt"), "new session commit\n").unwrap();
+        text(Path::new(&w.path), &["add", "."]).unwrap();
+        text(Path::new(&w.path), &["commit", "-m", "session"]).unwrap();
+        let session_head = text(Path::new(&w.path), &["rev-parse", "HEAD"]).unwrap();
+        remove(&store, &w, false).unwrap();
+        assert!(text(
+            &source,
+            &["rev-parse", "--verify", "refs/heads/deleted-in-source"]
+        )
+        .is_err());
+        assert!(text(&source, &["rev-parse", "--verify", "refs/tags/deleted-tag"]).is_err());
+        assert_eq!(
+            text(&source, &["rev-parse", w.branch.as_deref().unwrap()]).unwrap(),
+            session_head
+        );
+        assert!(text(&source, &["for-each-ref", "--format=%(refname)"])
+            .unwrap()
+            .lines()
+            .all(|r| !r.contains(&format!("kept-{}/{}", w.id, source_branch))));
+        let unchanged = create(&store, &source, "unchanged-session", None, None).unwrap();
+        remove(&store, &unchanged, false).unwrap();
+        assert!(text(
+            &source,
+            &["rev-parse", unchanged.branch.as_deref().unwrap()]
+        )
+        .is_ok());
+        let mut legacy = create(&store, &source, "legacy-ref-session", None, None).unwrap();
+        legacy.initial_refs = None;
+        text(&source, &["branch", "legacy-deleted"]).unwrap();
+        text(Path::new(&legacy.path), &["branch", "legacy-deleted"]).unwrap();
+        text(&source, &["branch", "-D", "legacy-deleted"]).unwrap();
+        preserve_history(&legacy).unwrap();
+        assert!(text(
+            &source,
+            &["rev-parse", "--verify", "refs/heads/legacy-deleted"]
+        )
+        .is_err());
+    }
+    #[test]
+    fn filtered_other_bases_fail_without_running_filters_or_cloning_secrets() {
+        let t = Temp::new();
+        let source = t.repo();
+        if !native_supported(&source) {
+            return;
+        }
+        let store = t.0.join("registry");
+        private_dir(&store).unwrap();
+        text(&source, &["branch", "other-base"]).unwrap();
+        fs::write(source.join("app.txt"), "new HEAD\n").unwrap();
+        text(&source, &["add", "."]).unwrap();
+        text(&source, &["commit", "-m", "new HEAD"]).unwrap();
+        let marker = t.0.join("filter-ran");
+        text(
+            &source,
+            &[
+                "config",
+                "filter.example.smudge",
+                &format!("touch {}", marker.display()),
+            ],
+        )
+        .unwrap();
+        assert!(create(
+            &store,
+            &source,
+            "filtered-base-session",
+            None,
+            Some("other-base")
+        )
+        .unwrap_err()
+        .contains("Choose the current HEAD"));
+        assert!(!marker.exists());
+        assert!(!source.with_file_name("project-cow").exists());
+        let w = create(&store, &source, "filtered-head-session", None, None).unwrap();
+        assert_eq!(
+            fs::read(Path::new(&w.path).join("app.txt")).unwrap(),
+            b"new HEAD\n"
+        );
+        assert!(!marker.exists());
+        remove(&store, &w, true).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn batched_raw_snapshots_handle_binary_symlinks_special_paths_and_sha256() {
+        for format in ["sha1", "sha256"] {
+            let t = Temp::new();
+            let root = t.0.join("working");
+            private_dir(&root).unwrap();
+            let root = canonical(&root).unwrap();
+            let objects = t.0.join("objects");
+            init_repo(&objects, format).unwrap();
+            fs::write(root.join("binary\nname\t.txt"), [0, 1, 2, 255]).unwrap();
+            fs::write(
+                root.join("quote\" and space.txt"),
+                b"payload\ndone\nblob\ndata 0\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("quote\" and space.txt", root.join("link")).unwrap();
+            let mut eligible =
+                BTreeSet::from(["binary\nname\t.txt".into(), "quote\" and space.txt".into()]);
+            #[cfg(unix)]
+            eligible.insert("link".into());
+            for i in 0..250 {
+                let p = format!("file-{i}.txt");
+                fs::write(root.join(&p), format!("file {i}\n")).unwrap();
+                eligible.insert(p);
+            }
+            let tree_oid = tree(&objects, &root, &eligible, &BTreeSet::new()).unwrap();
+            assert_eq!(
+                git(
+                    &objects,
+                    &["show", &format!("{tree_oid}:binary\nname\t.txt")],
+                    None
+                )
+                .unwrap(),
+                [0, 1, 2, 255]
+            );
+            assert_eq!(
+                git(
+                    &objects,
+                    &["show", &format!("{tree_oid}:quote\" and space.txt")],
+                    None
+                )
+                .unwrap(),
+                b"payload\ndone\nblob\ndata 0\n"
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                text(&objects, &["show", &format!("{tree_oid}:link")]).unwrap(),
+                "quote\" and space.txt"
+            );
+            assert_eq!(
+                tree(&objects, &root, &eligible, &BTreeSet::new()).unwrap(),
+                tree_oid
+            );
+            fs::write(root.join("file-1.txt"), "changed\n").unwrap();
+            assert_ne!(
+                tree(&objects, &root, &eligible, &BTreeSet::new()).unwrap(),
+                tree_oid
+            );
+        }
+    }
+    #[test]
+    fn abandoned_creation_recovers_secrets_but_preserves_registered_or_replaced_roots() {
+        let t = Temp::new();
+        let source = canonical(&t.repo()).unwrap();
+        if !native_supported(&source) {
+            return;
+        }
+        let store = t.0.join("registry");
+        private_dir(&store).unwrap();
+        private_dir(&source.join("deps")).unwrap();
+        fs::write(source.join("deps/secret.env"), "private checkout secret\n").unwrap();
+        for replaced in [false, true] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let path = source.with_file_name("project-cow").join(&id);
+            private_dir(path.parent().unwrap()).unwrap();
+            let record = store.join(&id);
+            private_dir(&record).unwrap();
+            let mut intent = CreationIntent {
+                id: id.clone(),
+                path: path.clone(),
+                project_cwd: source.clone(),
+                identity: None,
+                baseline_identity: None,
+                removal_path: None,
+            };
+            write_json(&record.join("creation.json"), &intent).unwrap();
+            private_dir(&path).unwrap();
+            intent.identity = Some(identity(&path).unwrap());
+            write_json(&record.join("creation.json"), &intent).unwrap();
+            clone_tree(&source, &path, true).unwrap();
+            assert!(path.join("deps/secret.env").exists());
+            if replaced {
+                fs::rename(&path, path.with_file_name(format!("saved-{id}"))).unwrap();
+                private_dir(&path).unwrap();
+                fs::write(path.join("keep.txt"), "replacement\n").unwrap();
+            }
+            dispatch(&store, json!({"command":"cow_list","args":{"cwd":source}})).unwrap();
+            if replaced {
+                assert_eq!(fs::read(path.join("keep.txt")).unwrap(), b"replacement\n");
+                assert!(record.join("creation.json").exists());
+            } else {
+                assert!(!path.exists());
+                assert!(!record.exists());
+            }
+        }
+        let w = create(&store, &source, "registered-intent-session", None, None).unwrap();
+        let record = store.join(&w.id);
+        let intent = CreationIntent {
+            id: w.id.clone(),
+            path: PathBuf::from(&w.path),
+            project_cwd: source.clone(),
+            identity: Some(w.identity),
+            baseline_identity: Some(
+                identity(&snapshot_directory(&store, Path::new(&w.path), &w.id).unwrap()).unwrap(),
+            ),
+            removal_path: None,
+        };
+        write_json(&record.join("creation.json"), &intent).unwrap();
+        dispatch(&store, json!({"command":"cow_list","args":{"cwd":source}})).unwrap();
+        assert!(Path::new(&w.path).join("deps/secret.env").exists());
+        assert!(record.join("workspace.json").exists());
+        assert!(!record.join("creation.json").exists());
     }
     #[test]
     fn failed_copy_upgrade_does_not_block_healthy_workspaces_or_other_projects() {

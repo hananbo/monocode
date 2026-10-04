@@ -931,6 +931,23 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             params![now_millis()],
         )?;
     }
+    if current < 19 {
+        // Copy ownership is part of every sidebar summary, so keep the
+        // projection covered without seeking through transcript blobs.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS sessions_cwd_cover_idx;
+             CREATE INDEX sessions_cwd_cover_idx
+               ON sessions (cwd, has_user_message, updated_at DESC, id, harness,
+                            model, runtime_mode, title, provider_session_id,
+                            created_at, branch, archived, pinned,
+                            linked_work_item_json, worktree_cwd, worktree_removed,
+                            is_draft, automation_id, cow_id);",
+        )?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (19, ?1)",
+            params![now_millis()],
+        )?;
+    }
     // Create even when a version row already exists (another build may have
     // used the same numbers, or a previous run recorded the version without
     // the table). Restore writes into these; missing tables look like a
@@ -970,7 +987,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                         model, runtime_mode, title, provider_session_id,
                         created_at, branch, archived, pinned,
                         linked_work_item_json, worktree_cwd, worktree_removed,
-                        is_draft, automation_id);",
+                        is_draft, automation_id, cow_id);",
     )?;
     crate::notes::ensure_notes_table(conn)?;
     crate::reminders::ensure_table(conn)?;
@@ -2229,16 +2246,21 @@ mod tests {
         let store = SessionStore::open_in_memory().unwrap();
         let conn = store.conn.lock().unwrap();
         upsert_session(&conn, &sample("s1", "/tmp/a", "A1")).unwrap();
-        for upgraded in [false, true] {
-            if upgraded {
-                // Exercise an existing v15 database with the old projection.
+        for version in [None, Some(15), Some(18)] {
+            if let Some(version) = version {
+                // Exercise pre-CoW databases whose index lacks copy ownership.
                 conn.execute_batch(
                     "DROP INDEX sessions_cwd_cover_idx;
                      CREATE INDEX sessions_cwd_cover_idx
                        ON sessions (cwd, has_user_message, updated_at DESC, id, harness,
                                     model, runtime_mode, title, provider_session_id,
-                                    created_at, branch, archived, pinned, linked_work_item_json);
-                     DELETE FROM schema_migrations WHERE version IN (16, 17, 18);",
+                                    created_at, branch, archived, pinned, linked_work_item_json,
+                                    worktree_cwd, worktree_removed, is_draft, automation_id);",
+                )
+                .unwrap();
+                conn.execute(
+                    "DELETE FROM schema_migrations WHERE version > ?1",
+                    params![version],
                 )
                 .unwrap();
                 migrate(&conn).unwrap();
@@ -2249,7 +2271,7 @@ mod tests {
                  SELECT id, cwd, harness, model, runtime_mode, title, provider_session_id,
                         created_at, updated_at, branch, archived, pinned,
                         linked_work_item_json, worktree_cwd, worktree_removed, is_draft,
-                        automation_id,
+                        automation_id, cow_id,
                         (SELECT summary FROM orchestration_sidebar WHERE lead_id = sessions.id)
                  FROM sessions
                  WHERE cwd = ?1
@@ -3168,7 +3190,7 @@ mod tests {
                  INSERT INTO schema_migrations (version, applied_at)
                    VALUES (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1),
                           (8, 1), (9, 1), (10, 1), (11, 1), (12, 1), (13, 1),
-                          (14, 1), (15, 1), (16, 1), (17, 1), (18, 1);",
+                          (14, 1), (15, 1), (16, 1), (17, 1), (18, 1), (19, 1);",
             )
             .unwrap();
         }

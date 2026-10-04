@@ -1222,3 +1222,23 @@ it("uses the same Git status and keep-session deletion flow for copy-on-write", 
   expect(onCheckRemove).toHaveBeenCalledWith("/repo", "/repo-cow/copy", true);
   expect(onRemove).toHaveBeenCalledWith("/repo", "/repo-cow/copy", true, true);
 });
+
+it("clears a recovered CoW listing failure on refresh", async () => {
+  vi.mocked(listCowWorkspaces)
+    .mockRejectedValueOnce(new Error("CoW listing unavailable"))
+    .mockResolvedValue([]);
+  await act(async () =>
+    root.render(
+      createElement(WorktreesPage, { cwd: "/repo", onRemove: vi.fn() }),
+    ),
+  );
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+    "CoW listing unavailable",
+  );
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="Refresh workspaces"]')!
+      .click(),
+  );
+  expect(container.querySelector('[role="alert"]')).toBeNull();
+});

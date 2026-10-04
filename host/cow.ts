@@ -1,9 +1,9 @@
-import { execFileSync, spawn } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HostStore } from "./store";
-import { resolveHostWorktree, resolveHostWorktreeAsync } from "./git-worktrees";
+import { resolveHostWorktreeAsync } from "./git-worktrees";
 
 export type HostCow = {
   id: string;
@@ -15,6 +15,7 @@ export type HostCow = {
   head: string;
   missing?: boolean;
   rootIdentity?: [string, string];
+  gitIdentity?: [string, string];
 };
 
 const filename =
@@ -44,33 +45,6 @@ function result<T>(output: string): T {
   return value.result as T;
 }
 
-export function hostCowSync<T>(
-  store: HostStore,
-  command: string,
-  args: Record<string, unknown>,
-): T {
-  const helper = cowHelper();
-  if (!helper)
-    throw new Error(
-      "Copy-on-write requires APFS and an updated native MonoCode Host on macOS.",
-    );
-  try {
-    return result<T>(
-      execFileSync(helper, ["--store", store.isolationDir], {
-        input: JSON.stringify({ command, args }),
-        encoding: "utf8",
-        timeout: 30_000,
-        maxBuffer: 16 * 1024 * 1024,
-        windowsHide: true,
-      }),
-    );
-  } catch (error) {
-    const output = (error as { stdout?: string }).stdout;
-    if (output) return result<T>(String(output));
-    throw error;
-  }
-}
-
 export function hostCow<T>(
   store: HostStore,
   command: string,
@@ -84,7 +58,10 @@ export function hostCow<T>(
         reason:
           "Copy-on-write requires APFS and an updated native MonoCode Host on macOS.",
       } as T);
-    if (command === "cow_list") return Promise.resolve([] as T);
+    if (command === "cow_list" || command === "cow_roots")
+      return Promise.resolve([] as T);
+    if (command === "cow_owner" && args.path !== undefined)
+      return Promise.resolve(null as T);
     return Promise.reject(
       new Error("Copy-on-write requires APFS and an updated native MonoCode Host on macOS."),
     );
@@ -162,21 +139,18 @@ function requestedPath(requested: unknown): string | undefined {
   return realpathSync.native(requested);
 }
 
-export function resolveHostWorkspace(
-  store: HostStore,
-  projectCwd: string,
-  requested: unknown,
-): string {
-  const actual = requestedPath(requested);
-  if (!actual || actual === projectCwd) return projectCwd;
-  if (cowHelper()) {
-    const copies = hostCowSync<HostCow[]>(store, "cow_list", {
-      cwd: projectCwd,
-    });
-    if (copies.some((copy) => !copy.missing && copy.path === actual))
-      return actual;
+/** Cheap ownership recheck after async authorization, before starting a turn. */
+export function assertHostCowIdentity(copy: HostCow): void {
+  for (const [path, identity] of [
+    [copy.path, copy.rootIdentity],
+    [join(copy.path, ".git"), copy.gitIdentity],
+  ] as const) {
+    if (!identity) throw new Error("Update MonoCode Host to verify copy-on-write ownership");
+    const actual = lstatSync(path, { bigint: true });
+    if (!actual.isDirectory() || actual.isSymbolicLink() ||
+      actual.dev.toString() !== identity[0] || actual.ino.toString() !== identity[1])
+      throw new Error("Copy-on-write ownership changed");
   }
-  return resolveHostWorktree(projectCwd, actual);
 }
 
 export async function resolveHostWorkspaceAsync(
@@ -186,23 +160,28 @@ export async function resolveHostWorkspaceAsync(
 ): Promise<string> {
   const actual = requestedPath(requested);
   if (!actual || actual === projectCwd) return projectCwd;
-  const copies = await hostCow<HostCow[]>(store, "cow_list", {
-    cwd: projectCwd,
-  });
-  if (copies.some((copy) => !copy.missing && copy.path === actual))
-    return actual;
-  return resolveHostWorktreeAsync(projectCwd, actual);
+  try {
+    return await resolveHostWorktreeAsync(projectCwd, actual);
+  } catch (error) {
+    const copy = await hostCow<HostCow | null>(store, "cow_owner", {
+      cwd: projectCwd, path: actual,
+    });
+    if (!copy) throw error;
+    assertHostCowIdentity(copy);
+    return copy.path;
+  }
 }
 
-export function ownedHostCow(
+export async function ownedHostCow(
   store: HostStore,
   projectCwd: string,
   id: string,
-): HostCow {
-  const copy = hostCowSync<HostCow[]>(store, "cow_list", {
-    cwd: projectCwd,
-  }).find((entry) => entry.id === id && !entry.missing);
-  if (!copy)
+): Promise<HostCow> {
+  const copy = await hostCow<HostCow>(store, "cow_owner", {
+    cwd: projectCwd, cowId: id,
+  });
+  if (!copy || copy.id !== id || copy.projectCwd !== realpathSync.native(projectCwd))
     throw new Error("This project’s copy-on-write workspace is unavailable.");
+  assertHostCowIdentity(copy);
   return copy;
 }
