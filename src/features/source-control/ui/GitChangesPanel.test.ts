@@ -89,6 +89,8 @@ let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
+  // Keep delayed file invalidations from reaching the next test's mocks.
+  vi.useFakeTimers();
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal(
     "ResizeObserver",
@@ -178,6 +180,8 @@ describe("GitChangesPanel commit message generation", () => {
 
 afterEach(() => {
   act(() => root.unmount());
+  vi.clearAllTimers();
+  vi.useRealTimers();
   container.remove();
   document.body
     .querySelectorAll("[data-popover-side]")
@@ -242,12 +246,6 @@ async function showTree() {
 }
 
 describe("GitChangesPanel folder actions", () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => {
-    vi.clearAllTimers();
-    vi.useRealTimers();
-  });
-
   it.each(["/repo", "/repo-cow/session", "remote://machine/home/user/repo"])(
     "stages a collapsed folder in one operation for %s",
     async (cwd) => {
@@ -407,6 +405,10 @@ describe("GitChangesPanel folder actions", () => {
       '[aria-label="Stage Changes in src"]',
     )!;
     await act(async () => stage.click());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
 
     expect(alert).toHaveBeenCalledWith("Git index is locked");
     expect(stage.disabled).toBe(false);
