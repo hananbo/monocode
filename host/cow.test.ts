@@ -400,10 +400,12 @@ it("uses ordinary Git commands and preserves local history on clone removal", as
   git("config", "credential.password", "dummy-fixture");
   git("config", "http.extraHeader", "Authorization: dummy-fixture");
   git("remote", "set-url", "origin", `ssh://fixture${remote}`);
+  const globalIgnore = join(folder, "global-ignore");
+  writeFileSync(globalIgnore, ".DS_Store\n");
   const authInclude = join(folder, "auth-config");
   writeFileSync(
     authInclude,
-    "[credential]\nusername = fixture-user\nhelper =\nhelper = fixture-helper with spaces\n",
+    `[core]\nexcludesFile = ${globalIgnore}\n[credential]\nusername = fixture-user\nhelper =\nhelper = fixture-helper with spaces\n`,
   );
   const globalConfig = join(folder, "global-config");
   writeFileSync(
@@ -411,6 +413,7 @@ it("uses ordinary Git commands and preserves local history on clone removal", as
     `[includeIf "gitdir:${git("rev-parse", "--absolute-git-dir")}"]\npath = ${authInclude}\n`,
   );
   vi.stubEnv("GIT_CONFIG_GLOBAL", globalConfig);
+  writeFileSync(join(cwd, ".DS_Store"), "ignored globally\n");
   const hookMarker = join(folder, "hook-ran");
   const hook = join(cwd, ".git", "hooks", "pre-commit");
   writeFileSync(hook, `#!/bin/sh\ntouch '${hookMarker}'\nexit 1\n`);
@@ -446,6 +449,8 @@ it("uses ordinary Git commands and preserves local history on clone removal", as
       gitAt(copy!.path, "config", "--local", "--get", "http.extraHeader"),
     ).toThrow();
     expect(gitAt(copy.path, "config", "--get", "core.sshCommand")).toBe(ssh);
+    expect(readFileSync(join(copy.path, ".DS_Store"), "utf8")).toBe("ignored globally\n");
+    expect(gitAt(copy.path, "check-ignore", ".DS_Store")).toBe(".DS_Store");
     expect(gitAt(copy.path, "config", "--get", "credential.username")).toBe(
       "fixture-user",
     );
@@ -587,6 +592,7 @@ it("uses ordinary Git commands and preserves local history on clone removal", as
       ],
     });
     vi.unstubAllEnvs();
+    vi.stubEnv("GIT_CONFIG_GLOBAL", globalConfig);
     await run("git_create_branch", { name: "local-only" });
     writeFileSync(join(copy.path, "local.txt"), "unpublished\n");
     await run("git_stage_all");

@@ -41,11 +41,27 @@ If an older copy cannot be upgraded because its source is unavailable, its files
 and ownership record are retained. Other copies and ordinary projects remain
 usable.
 
-External symlinks, nested repositories, submodules, unresolved indexes,
+Tracked external symlinks, nested repositories, submodules, unresolved indexes,
 sparse/split indexes, assume-unchanged or skip-worktree entries, shallow/partial
 clones, and object alternates are rejected. Copy-on-write isolates files;
 provider permissions, ports, databases, and external services keep their existing
 rules.
+
+Creation checks tracked and nonignored repository content for concurrent edits.
+Ignored runtime logs and caches are captured per file with native APFS clones;
+background writes and directory timestamp changes do not require the checkout
+to be idle. Git-ignored Unix sockets are omitted. A repository file, HEAD, file
+list, or ref change still aborts creation with the relevant path or condition.
+
+Untracked and ignored external symlinks are materialized as private APFS copies
+of their targets. Internal symlinks remain links inside the copy. Editing a
+materialized skill or dependency cannot change its external original. Cycles,
+ancestor targets (including APFS mount aliases), excessive nesting, nested Git
+repositories, unsupported filesystems, and special targets are rejected. An
+untracked linked directory becomes ordinary untracked files in the copy; users
+can stage those files through the existing Git controls. Worker integration
+refuses to write through the original source link. Tracked external links remain
+unsupported because materialization would change their tracked Git type.
 
 ## Creation and storage
 

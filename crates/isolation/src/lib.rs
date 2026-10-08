@@ -321,17 +321,19 @@ fn repo(p: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 fn paths(root: &Path) -> Result<BTreeSet<String>> {
-    let bytes = git(
-        root,
-        &[
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ],
-        None,
-    )?;
+    git_paths(root, &["--cached", "--others", "--exclude-standard"])
+}
+fn ignored_paths(root: &Path) -> Result<BTreeSet<String>> {
+    git_paths(root, &["--others", "--ignored", "--exclude-standard"])
+}
+fn git_paths(root: &Path, options: &[&str]) -> Result<BTreeSet<String>> {
+    let mut args = vec!["ls-files", "-z"];
+    args.extend_from_slice(options);
+    let output = ignore_command(root)?.args(args).output().map_err(err)?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    let bytes = output.stdout;
     let mut out = BTreeSet::new();
     for b in bytes.split(|b| *b == 0).filter(|b| !b.is_empty()) {
         let p = String::from_utf8(b.to_vec()).map_err(|_| "Non-UTF-8 paths are unsupported")?;
@@ -340,14 +342,54 @@ fn paths(root: &Path) -> Result<BTreeSet<String>> {
     }
     Ok(out)
 }
+fn ignore_command(root: &Path) -> Result<Command> {
+    // Preserve effective ignore rules without enabling executable global Git settings.
+    let output = config_reader(root)
+        .args([
+            "config",
+            "--includes",
+            "--path",
+            "--null",
+            "--get",
+            "core.excludesFile",
+        ])
+        .output()
+        .map_err(err)?;
+    let mut command = git_base(root);
+    match output.status.code() {
+        Some(0) => {
+            let value = String::from_utf8(output.stdout).map_err(err)?;
+            command.arg("-c").arg(format!(
+                "core.excludesFile={}",
+                value.trim_end_matches('\0')
+            ));
+        }
+        Some(1) => {}
+        _ => return Err("Cannot read Git ignore configuration".into()),
+    }
+    Ok(command)
+}
 #[cfg(unix)]
 fn ignored_socket(root: &Path, path: &Path) -> Result<bool> {
     let relative = path.strip_prefix(root).map_err(err)?;
     // Runtime sockets cannot be cloned or used by the isolated process. Respect
     // Git's index: an ignored pattern must never hide a tracked file replacement.
-    let output = git_base(root)
+    let output = ignore_command(root)?
         .args(["check-ignore", "--quiet", "--"])
         .arg(relative)
+        .output()
+        .map_err(err)?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(String::from_utf8_lossy(&output.stderr).to_string()),
+    }
+}
+#[cfg(unix)]
+fn tracked_path(root: &Path, relative: &str) -> Result<bool> {
+    let output = git_base(root)
+        .arg("--literal-pathspecs")
+        .args(["ls-files", "--error-unmatch", "--", relative])
         .output()
         .map_err(err)?;
     match output.status.code() {
@@ -442,32 +484,125 @@ fn relative_link(parent: &Path, target: &Path) -> PathBuf {
 }
 #[cfg(unix)]
 fn clone_tree(source: &Path, dest: &Path, exclude_git: bool) -> Result<()> {
+    clone_tree_inner(
+        source,
+        dest,
+        exclude_git,
+        &BTreeSet::from([canonical(source)?]),
+        false,
+        identity(source)?,
+    )
+}
+#[cfg(unix)]
+fn clone_external(source: &Path, dest: &Path, ancestors: &BTreeSet<PathBuf>) -> Result<()> {
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, PermissionsExt},
+    };
+    if ancestors.contains(source) || ancestors.len() >= 32 {
+        return Err(format!(
+            "External symlink cycle or excessive nesting: {}",
+            source.display()
+        ));
+    }
+    check_filesystem(source)?;
+    let metadata = fs::symlink_metadata(source).map_err(err)?;
+    if metadata.is_dir() {
+        for root in ancestors {
+            for ancestor in root.ancestors() {
+                let m = fs::metadata(ancestor).map_err(err)?;
+                if (m.dev(), m.ino()) == (metadata.dev(), metadata.ino()) {
+                    return Err(format!(
+                        "External symlink cycle or ancestor target: {}",
+                        source.display()
+                    ));
+                }
+            }
+        }
+        let mut ancestors = ancestors.clone();
+        ancestors.insert(source.to_path_buf());
+        clone_tree_inner(
+            source,
+            dest,
+            false,
+            &ancestors,
+            true,
+            (metadata.dev(), metadata.ino()),
+        )
+    } else if metadata.is_file() {
+        let path = source
+            .strip_prefix("/")
+            .map_err(err)?
+            .to_str()
+            .ok_or("Non-UTF-8 path")?;
+        let file = open_regular(Path::new("/"), path)?;
+        let opened = file.metadata().map_err(err)?;
+        if (metadata.dev(), metadata.ino()) != (opened.dev(), opened.ino()) {
+            return Err("External target replaced while cloning; retry".into());
+        }
+        let parent = open_dir(dest.parent().ok_or("Missing clone parent")?)?;
+        let name = std::ffi::CString::new(dest.file_name().ok_or("Missing clone name")?.as_bytes())
+            .map_err(err)?;
+        clone_file(&file, &parent, &name)?;
+        fs::set_permissions(dest, fs::Permissions::from_mode(opened.mode() & 0o777)).map_err(err)
+    } else {
+        Err(format!(
+            "Unsupported external symlink target: {}",
+            source.display()
+        ))
+    }
+}
+#[cfg(unix)]
+fn clone_tree_inner(
+    source: &Path,
+    dest: &Path,
+    exclude_git: bool,
+    ancestors: &BTreeSet<PathBuf>,
+    materialized: bool,
+    expected_identity: (u64, u64),
+) -> Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    #[allow(clippy::unnecessary_cast)] // stat field widths differ between APFS and Linux.
-    fn walk(
-        src: &Path,
-        dst: &Path,
-        root: &Path,
-        out: &Path,
-        source_fd: &File,
+    struct Context<'a> {
+        root: &'a Path,
+        out: &'a Path,
         root_dev: u64,
-        exclude_git: bool,
-    ) -> Result<()> {
+        eligible: Option<&'a BTreeSet<String>>,
+        ancestors: &'a BTreeSet<PathBuf>,
+        materialized: bool,
+    }
+    #[allow(clippy::unnecessary_cast)] // stat field widths differ across platforms.
+    fn walk(src: &Path, dst: &Path, source_fd: &File, context: &Context<'_>) -> Result<()> {
+        let Context {
+            root,
+            out,
+            root_dev,
+            eligible,
+            ancestors,
+            materialized,
+        } = *context;
         let dest_fd = open_dir(dst)?;
         for entry in fs::read_dir(src).map_err(err)? {
             let entry = entry.map_err(err)?;
             let name = entry.file_name();
             if name == ".git" {
-                if src == root && exclude_git {
+                if src == root && eligible.is_some() {
                     continue;
                 }
-                if exclude_git {
+                if eligible.is_some() || materialized {
                     return Err(format!("Nested Git repository: {}", entry.path().display()));
                 }
             }
             use std::os::unix::ffi::OsStrExt;
             let cname = std::ffi::CString::new(name.as_bytes()).map_err(err)?;
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .map_err(err)?
+                .to_str()
+                .ok_or("Non-UTF-8 path")?
+                .to_string();
+            let runtime = materialized || eligible.is_some_and(|paths| !paths.contains(&relative));
             let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
             if unsafe {
                 libc::fstatat(
@@ -478,7 +613,11 @@ fn clone_tree(source: &Path, dest: &Path, exclude_git: bool) -> Result<()> {
                 )
             } != 0
             {
-                return Err(err(std::io::Error::last_os_error()));
+                let error = std::io::Error::last_os_error();
+                if runtime && error.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                return Err(err(error));
             }
             let stat = unsafe { stat.assume_init() };
             if stat.st_dev as u64 != root_dev {
@@ -486,7 +625,8 @@ fn clone_tree(source: &Path, dest: &Path, exclude_git: bool) -> Result<()> {
             }
             let target = dst.join(&name);
             let kind = stat.st_mode & libc::S_IFMT;
-            if kind == libc::S_IFSOCK && exclude_git && ignored_socket(root, &entry.path())? {
+            if kind == libc::S_IFSOCK && eligible.is_some() && ignored_socket(root, &entry.path())?
+            {
                 continue;
             }
             if kind == libc::S_IFLNK {
@@ -500,7 +640,11 @@ fn clone_tree(source: &Path, dest: &Path, exclude_git: bool) -> Result<()> {
                     )
                 };
                 if length < 0 {
-                    return Err(err(std::io::Error::last_os_error()));
+                    let error = std::io::Error::last_os_error();
+                    if runtime && error.kind() == std::io::ErrorKind::NotFound {
+                        continue;
+                    }
+                    return Err(err(error));
                 }
                 if length as usize == buffer.len() {
                     return Err("Symlink target is too long".into());
@@ -508,9 +652,26 @@ fn clone_tree(source: &Path, dest: &Path, exclude_git: bool) -> Result<()> {
                 buffer.truncate(length as usize);
                 use std::os::unix::ffi::OsStringExt;
                 let link = PathBuf::from(std::ffi::OsString::from_vec(buffer));
-                let resolved = canonical(&src.join(&link))?;
+                let resolved = match canonical(&src.join(&link)) {
+                    Ok(path) => path,
+                    Err(_)
+                        if runtime
+                            && matches!(fs::symlink_metadata(entry.path()), Err(e) if e.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        continue
+                    }
+                    Err(error) => {
+                        return Err(format!("Cannot resolve symlink {relative}: {error}"))
+                    }
+                };
                 if !resolved.starts_with(root) {
-                    return Err(format!("External symlink: {}", entry.path().display()));
+                    if !materialized && (eligible.is_none() || tracked_path(root, &relative)?) {
+                        return Err(format!(
+                            "Tracked or unsupported external symlink: {relative}"
+                        ));
+                    }
+                    clone_external(&resolved, &target, ancestors)?;
+                    continue;
                 }
                 let link = if link.is_absolute() {
                     relative_link(
@@ -523,6 +684,7 @@ fn clone_tree(source: &Path, dest: &Path, exclude_git: bool) -> Result<()> {
                 std::os::unix::fs::symlink(link, target).map_err(err)?;
             } else if kind == libc::S_IFDIR || kind == libc::S_IFREG {
                 let flags = libc::O_RDONLY
+                    | libc::O_NONBLOCK
                     | libc::O_NOFOLLOW
                     | if kind == libc::S_IFDIR {
                         libc::O_DIRECTORY
@@ -531,24 +693,28 @@ fn clone_tree(source: &Path, dest: &Path, exclude_git: bool) -> Result<()> {
                     };
                 let fd = unsafe { libc::openat(source_fd.as_raw_fd(), cname.as_ptr(), flags) };
                 if fd < 0 {
-                    return Err(err(std::io::Error::last_os_error()));
+                    let error = std::io::Error::last_os_error();
+                    if runtime && error.kind() == std::io::ErrorKind::NotFound {
+                        continue;
+                    }
+                    return Err(err(error));
                 }
                 let file = unsafe { File::from_raw_fd(fd) };
                 let before = file.metadata().map_err(err)?;
+                if before.mode() & libc::S_IFMT as u32 != kind as u32 {
+                    return Err(format!(
+                        "Source file type changed while cloning: {relative}; retry"
+                    ));
+                }
                 if before.ino() != stat.st_ino as u64 || before.dev() != stat.st_dev as u64 {
-                    return Err("Source changed while cloning".into());
+                    if runtime && kind == libc::S_IFREG {
+                        continue;
+                    }
+                    return Err(format!("Source changed while cloning: {relative}; retry"));
                 }
                 if kind == libc::S_IFDIR {
                     private_dir(&target)?;
-                    walk(
-                        &entry.path(),
-                        &target,
-                        root,
-                        out,
-                        &file,
-                        root_dev,
-                        exclude_git,
-                    )?;
+                    walk(&entry.path(), &target, &file, context)?;
                 } else {
                     if target.exists() {
                         if file_digest(&entry.path())? != file_digest(&target)? {
@@ -561,13 +727,21 @@ fn clone_tree(source: &Path, dest: &Path, exclude_git: bool) -> Result<()> {
                         .map_err(err)?;
                 }
                 let after = file.metadata().map_err(err)?;
-                if before.len() != after.len()
-                    || before.mtime() != after.mtime()
-                    || before.mtime_nsec() != after.mtime_nsec()
-                    || before.ctime() != after.ctime()
-                    || before.ctime_nsec() != after.ctime_nsec()
+                if kind == libc::S_IFREG
+                    && !runtime
+                    && (before.len() != after.len()
+                        || before.mtime() != after.mtime()
+                        || before.mtime_nsec() != after.mtime_nsec()
+                        || before.ctime() != after.ctime()
+                        || before.ctime_nsec() != after.ctime_nsec())
                 {
-                    return Err("Source changed while cloning; retry".into());
+                    return Err(format!("Source changed while cloning: {relative}; retry"));
+                }
+                if kind == libc::S_IFDIR && identity(&entry.path())? != (before.dev(), before.ino())
+                {
+                    return Err(format!(
+                        "Source directory replaced while cloning: {relative}; retry"
+                    ));
                 }
             } else {
                 return Err(format!(
@@ -576,19 +750,38 @@ fn clone_tree(source: &Path, dest: &Path, exclude_git: bool) -> Result<()> {
                 ));
             }
         }
+        let metadata = source_fd.metadata().map_err(err)?;
+        if identity(src)? != (metadata.dev(), metadata.ino()) {
+            return Err(format!(
+                "Source directory replaced while cloning: {}; retry",
+                src.display()
+            ));
+        }
         Ok(())
     }
+    let eligible = if exclude_git {
+        Some(paths(source)?)
+    } else {
+        None
+    };
     private_dir(dest)?;
     let fd = open_dir(source)?;
-    walk(
-        source,
-        dest,
-        source,
-        dest,
-        &fd,
-        fd.metadata().map_err(err)?.dev(),
-        exclude_git,
-    )
+    let opened = fd.metadata().map_err(err)?;
+    if (opened.dev(), opened.ino()) != expected_identity {
+        return Err(format!(
+            "Source directory replaced while cloning: {}; retry",
+            source.display()
+        ));
+    }
+    let context = Context {
+        root: source,
+        out: dest,
+        root_dev: fd.metadata().map_err(err)?.dev(),
+        eligible: eligible.as_ref(),
+        ancestors,
+        materialized,
+    };
+    walk(source, dest, &fd, &context)
 }
 #[cfg(not(unix))]
 fn clone_tree(_: &Path, _: &Path, _: bool) -> Result<()> {
@@ -927,7 +1120,10 @@ fn open_regular(root: &Path, relative_path: &str) -> Result<File> {
             libc::openat(
                 parent.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | if directory { libc::O_DIRECTORY } else { 0 },
+                libc::O_RDONLY
+                    | libc::O_NONBLOCK
+                    | libc::O_NOFOLLOW
+                    | if directory { libc::O_DIRECTORY } else { 0 },
             )
         };
         if fd < 0 {
@@ -1123,11 +1319,17 @@ struct Fingerprint {
     changed: (i64, i64),
     mode: u32,
     link: Option<String>,
+    external: bool,
 }
 #[cfg(unix)]
-fn fingerprint(root: &Path) -> Result<BTreeMap<String, Fingerprint>> {
+fn fingerprint(root: &Path, eligible: &BTreeSet<String>) -> Result<BTreeMap<String, Fingerprint>> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    fn walk(root: &Path, p: &Path, out: &mut BTreeMap<String, Fingerprint>) -> Result<()> {
+    fn walk(
+        root: &Path,
+        p: &Path,
+        eligible: &BTreeSet<String>,
+        out: &mut BTreeMap<String, Fingerprint>,
+    ) -> Result<()> {
         let dir = open_dir(p)?;
         let directory_identity = (
             dir.metadata().map_err(err)?.dev(),
@@ -1145,23 +1347,51 @@ fn fingerprint(root: &Path) -> Result<BTreeMap<String, Fingerprint>> {
                 .to_str()
                 .ok_or("Non-UTF-8 path")?
                 .to_string();
+            {
+                let prefix = format!("{rel}/");
+                if !eligible.contains(&rel)
+                    && !eligible
+                        .range(prefix.clone()..)
+                        .next()
+                        .is_some_and(|p| p.starts_with(&prefix))
+                {
+                    continue;
+                }
+            }
             checked_file(root, &rel)?;
             let mut m = fs::symlink_metadata(&path).map_err(err)?;
             if m.is_dir() {
-                walk(root, &path, out)?;
+                walk(root, &path, eligible, out)?;
                 continue;
             }
+            let mut external = false;
             let link = if m.file_type().is_symlink() {
-                Some(
-                    blob(root, &rel)?
-                        .ok_or("Symlink disappeared during capture")?
-                        .1,
-                )
+                external = !canonical(&path)?.starts_with(root);
+                if external {
+                    if tracked_path(root, &rel)? {
+                        return Err(format!("Tracked external symlink: {rel}"));
+                    }
+                    Some(
+                        fs::read_link(&path)
+                            .map_err(err)?
+                            .to_str()
+                            .ok_or("Non-UTF-8 path")?
+                            .to_string(),
+                    )
+                } else {
+                    Some(
+                        blob(root, &rel)?
+                            .ok_or("Symlink disappeared during capture")?
+                            .1,
+                    )
+                }
             } else if m.is_file() {
                 let file = open_regular(root, &rel)?;
                 let opened = file.metadata().map_err(err)?;
                 if (m.dev(), m.ino()) != (opened.dev(), opened.ino()) {
-                    return Err("Source changed during metadata capture; retry".into());
+                    return Err(format!(
+                        "Source changed during metadata capture: {rel}; retry"
+                    ));
                 }
                 m = opened;
                 None
@@ -1180,6 +1410,7 @@ fn fingerprint(root: &Path) -> Result<BTreeMap<String, Fingerprint>> {
                     changed: (m.ctime(), m.ctime_nsec()),
                     mode: m.mode() & 0o777,
                     link,
+                    external,
                 },
             );
         }
@@ -1189,26 +1420,34 @@ fn fingerprint(root: &Path) -> Result<BTreeMap<String, Fingerprint>> {
         Ok(())
     }
     let mut out = BTreeMap::new();
-    walk(root, root, &mut out)?;
+    walk(root, root, eligible, &mut out)?;
     Ok(out)
 }
 #[cfg(not(unix))]
-fn fingerprint(_: &Path) -> Result<BTreeMap<String, Fingerprint>> {
+fn fingerprint(_: &Path, _: &BTreeSet<String>) -> Result<BTreeMap<String, Fingerprint>> {
     Err(UNSUPPORTED_FILESYSTEM.into())
+}
+impl Fingerprint {
+    fn matches_clone(&self, copy: &Self) -> bool {
+        self.size == copy.size
+            && self.mode == copy.mode
+            && self.link == copy.link
+            && (self.link.is_some() || self.modified == copy.modified)
+    }
 }
 fn clone_matches(
     before: &BTreeMap<String, Fingerprint>,
     clone: &BTreeMap<String, Fingerprint>,
 ) -> bool {
-    before.len() == clone.len()
-        && before.iter().all(|(path, original)| {
-            clone.get(path).is_some_and(|copy| {
-                original.size == copy.size
-                    && original.mode == copy.mode
-                    && original.link == copy.link
-                    && (original.link.is_some() || original.modified == copy.modified)
+    before.values().filter(|f| !f.external).count() == clone.len()
+        && before
+            .iter()
+            .filter(|(_, f)| !f.external)
+            .all(|(path, original)| {
+                clone
+                    .get(path)
+                    .is_some_and(|copy| original.matches_clone(copy))
             })
-        })
 }
 fn local_refs(root: &Path) -> Result<BTreeMap<String, String>> {
     text(
@@ -1367,13 +1606,8 @@ fn create(
     {
         return Err("The generated session branch already exists; start a new session".into());
     }
-    let before = fingerprint(&source)?;
     let eligible = paths(&source)?;
-    let excluded = before
-        .keys()
-        .filter(|p| !eligible.contains(*p))
-        .cloned()
-        .collect();
+    let before = fingerprint(&source, &eligible)?;
     let id = uuid::Uuid::new_v4().to_string();
     let parent = project.with_file_name(format!(
         "{}-cow",
@@ -1407,13 +1641,53 @@ fn create(
             &source_head,
             branch.as_deref().unwrap_or("cow"),
         )?;
-        if before != fingerprint(&source)?
-            || !clone_matches(&before, &fingerprint(&path)?)
-            || text(&source, &["rev-parse", "HEAD"])? != source_head
-            || paths(&source)? != eligible
-            || local_refs(&source)? != initial_refs
-        {
-            return Err("Source changed while cloning; retry".into());
+        let after = fingerprint(&source, &eligible)?;
+        if before != after {
+            let changed = before
+                .keys()
+                .chain(after.keys())
+                .find(|p| before.get(*p) != after.get(*p))
+                .ok_or("Invalid source comparison")?;
+            return Err(format!("Source changed while cloning: {changed}; retry"));
+        }
+        let copied_eligible = paths(&path)?;
+        let mut copied = fingerprint(&path, &copied_eligible)?;
+        for added in copied_eligible.difference(&eligible) {
+            if !before
+                .iter()
+                .any(|(p, f)| f.external && added.starts_with(&format!("{p}/")))
+            {
+                return Err(format!(
+                    "Clone captured a new repository file: {added}; retry"
+                ));
+            }
+        }
+        let excluded = ignored_paths(&path)?;
+        copied.retain(|p, _| eligible.contains(p) && before.get(p).is_none_or(|f| !f.external));
+        if !clone_matches(&before, &copied) {
+            let changed = before
+                .iter()
+                .filter(|(_, f)| !f.external)
+                .find(|(p, original)| {
+                    !copied
+                        .get(*p)
+                        .is_some_and(|copy| original.matches_clone(copy))
+                })
+                .map(|(p, _)| p)
+                .or_else(|| copied.keys().find(|p| !before.contains_key(*p)))
+                .ok_or("Invalid clone comparison")?;
+            return Err(format!(
+                "Clone does not match captured repository file: {changed}; retry"
+            ));
+        }
+        if text(&source, &["rev-parse", "HEAD"])? != source_head {
+            return Err("Source HEAD changed while cloning; retry".into());
+        }
+        if paths(&source)? != eligible {
+            return Err("Source file list changed while cloning; retry".into());
+        }
+        if local_refs(&source)? != initial_refs {
+            return Err("Source Git refs changed while cloning; retry".into());
         }
         if head != source_head {
             text(
@@ -2280,6 +2554,229 @@ mod tests {
         assert_eq!(text(&source, &["status", "--porcelain"]).unwrap(), "");
     }
     #[cfg(unix)]
+    fn runtime_churn_fixture(kind: &str) {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let t = Temp(PathBuf::from("/tmp").join(format!("cow-{}", uuid::Uuid::new_v4())));
+        private_dir(&t.0).unwrap();
+        let source = t.repo();
+        if !native_supported(&source) {
+            return;
+        }
+        fs::create_dir(source.join("deps")).unwrap();
+        fs::write(source.join("deps/runtime.log"), "runtime\n").unwrap();
+        fs::write(source.join("deps/cache"), "cache\n").unwrap();
+        for n in 0..200 {
+            fs::write(source.join(format!("stable-{n}.txt")), "stable\n").unwrap();
+        }
+        text(&source, &["add", "."]).unwrap();
+        text(&source, &["commit", "-m", "stable files"]).unwrap();
+        let store = t.0.join("registry");
+        private_dir(&store).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker_source = source.clone();
+        let kind_owned = kind.to_string();
+        let (ready, started) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let directory = open_dir(&worker_source.join("deps")).unwrap();
+            let mut log = fs::OpenOptions::new()
+                .append(true)
+                .open(worker_source.join("deps/runtime.log"))
+                .unwrap();
+            let mut first = true;
+            while !worker_stop.load(Ordering::SeqCst) {
+                match kind_owned.as_str() {
+                    "log" => {
+                        log.write_all(b"background\n").unwrap();
+                    }
+                    "directory" => {
+                        directory
+                            .set_times(
+                                fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
+                            )
+                            .unwrap();
+                    }
+                    "cache" => {
+                        fs::write(worker_source.join("deps/new-cache"), "cache\n").unwrap();
+                        fs::rename(
+                            worker_source.join("deps/new-cache"),
+                            worker_source.join("deps/cache"),
+                        )
+                        .unwrap();
+                    }
+                    "socket" => {
+                        let path = worker_source.join("deps/s");
+                        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+                        drop(listener);
+                        fs::remove_file(path).unwrap();
+                    }
+                    "tracked" => {
+                        fs::write(worker_source.join("app.txt"), "changing\n").unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                if first {
+                    ready.send(()).unwrap();
+                    first = false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        started.recv().unwrap();
+        let result = create(&store, &source, "churn", None, None);
+        stop.store(true, Ordering::SeqCst);
+        writer.join().unwrap();
+        if kind == "tracked" {
+            assert!(result.unwrap_err().contains("Source changed"));
+            return;
+        }
+        let w = result.unwrap();
+        let copy = Path::new(&w.path);
+        assert_eq!(
+            fs::read(copy.join("app.txt")).unwrap(),
+            fs::read(source.join("app.txt")).unwrap()
+        );
+        assert_eq!(text(&source, &["status", "--porcelain"]).unwrap(), "");
+        assert_eq!(status(&store, &w).unwrap()["files"], json!([]));
+        let original = fs::read(source.join("deps/runtime.log")).unwrap();
+        fs::write(copy.join("deps/runtime.log"), "copy only\n").unwrap();
+        assert_eq!(fs::read(source.join("deps/runtime.log")).unwrap(), original);
+        remove(&store, &w, false).unwrap();
+        assert!(!copy.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ignored_log_writes_allow_isolation() {
+        runtime_churn_fixture("log");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn directory_metadata_churn_allows_isolation() {
+        runtime_churn_fixture("directory");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ignored_cache_replacement_allows_isolation() {
+        runtime_churn_fixture("cache");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ignored_socket_churn_allows_isolation() {
+        runtime_churn_fixture("socket");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn tracked_changes_still_refuse_isolation() {
+        runtime_churn_fixture("tracked");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn replaced_external_directory_is_not_captured() {
+        let t = Temp::new();
+        let source = t.repo();
+        if !native_supported(&source) {
+            return;
+        }
+        let external = t.0.join("external");
+        fs::create_dir(&external).unwrap();
+        let expected = identity(&external).unwrap();
+        fs::rename(&external, t.0.join("old-external")).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("unexpected"), "do not capture").unwrap();
+        let copy = t.0.join("copy");
+        let error = clone_tree_inner(
+            &external,
+            &copy,
+            false,
+            &BTreeSet::from([source]),
+            true,
+            expected,
+        )
+        .unwrap_err();
+        assert!(error.contains("directory replaced"), "{error}");
+        assert!(!copy.join("unexpected").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn external_links_are_private_native_copies() {
+        use std::os::unix::fs::symlink;
+        let t = Temp::new();
+        let source = t.repo();
+        if !native_supported(&source) {
+            return;
+        }
+        let store = t.0.join("registry");
+        private_dir(&store).unwrap();
+        let external = t.0.join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("SKILL.md"), "original\n").unwrap();
+        fs::write(t.0.join("other"), "other\n").unwrap();
+        symlink("SKILL.md", external.join("internal")).unwrap();
+        symlink(t.0.join("other"), external.join("chained")).unwrap();
+        fs::create_dir(source.join("deps")).unwrap();
+        symlink(&external, source.join("deps/skill")).unwrap();
+        symlink(&external, source.join("skill")).unwrap();
+        fs::write(source.join("skill-other"), "tracked\n").unwrap();
+        text(&source, &["add", "skill-other"]).unwrap();
+        symlink(&external, source.join("skill*")).unwrap();
+        assert!(!tracked_path(&source, "skill*").unwrap());
+        symlink(&external, source.join("[s]kill")).unwrap();
+        text(&source, &["--literal-pathspecs", "add", "[s]kill"]).unwrap();
+        assert!(tracked_path(&source, "[s]kill").unwrap());
+        text(&source, &["--literal-pathspecs", "reset", "--", "[s]kill"]).unwrap();
+        fs::remove_file(source.join("[s]kill")).unwrap();
+        let w = create(&store, &source, "external", None, None).unwrap();
+        let copy = Path::new(&w.path);
+        assert!(fs::symlink_metadata(copy.join("skill")).unwrap().is_dir());
+        assert_eq!(
+            fs::read(copy.join("skill/internal")).unwrap(),
+            b"original\n"
+        );
+        assert_eq!(fs::read(copy.join("skill/chained")).unwrap(), b"other\n");
+        assert_eq!(
+            fs::read(copy.join("skill*/SKILL.md")).unwrap(),
+            b"original\n"
+        );
+        assert_eq!(status(&store, &w).unwrap()["files"], json!([]));
+        fs::write(copy.join("skill/SKILL.md"), "copy edit\n").unwrap();
+        fs::write(copy.join("deps/skill/SKILL.md"), "ignored edit\n").unwrap();
+        assert_eq!(fs::read(external.join("SKILL.md")).unwrap(), b"original\n");
+        assert!(apply(&store, &w, &source).is_err());
+        assert_eq!(fs::read(external.join("SKILL.md")).unwrap(), b"original\n");
+        remove(&store, &w, true).unwrap();
+        assert!(!copy.exists());
+        assert!(source.join("skill").is_symlink());
+        symlink(&source, external.join("cycle")).unwrap();
+        assert!(create(&store, &source, "cycle", None, None)
+            .unwrap_err()
+            .contains("cycle"));
+        fs::remove_file(external.join("cycle")).unwrap();
+        symlink(&t.0, external.join("ancestor")).unwrap();
+        assert!(create(&store, &source, "ancestor", None, None)
+            .unwrap_err()
+            .contains("ancestor"));
+        fs::remove_file(external.join("ancestor")).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let alias = PathBuf::from(format!(
+                "/System/Volumes/Data{}",
+                canonical(&t.0).unwrap().display()
+            ));
+            assert!(alias.exists(), "APFS alias coverage unavailable");
+            symlink(&alias, external.join("alias")).unwrap();
+            let error = create(&store, &source, "alias", None, None).unwrap_err();
+            assert!(error.contains("ancestor"), "{error}");
+            fs::remove_file(external.join("alias")).unwrap();
+        }
+        init_repo(&external.join("nested"), "sha1").unwrap();
+        assert!(create(&store, &source, "nested", None, None)
+            .unwrap_err()
+            .contains("Nested Git repository"));
+    }
+    #[cfg(unix)]
     #[test]
     fn ignored_runtime_sockets_do_not_block_isolation() {
         use std::os::unix::net::UnixListener;
@@ -2987,7 +3484,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn linked_worktree_private_git_and_external_symlink_rejection() {
+    fn linked_worktree_private_git_and_tracked_external_symlink_rejection() {
         let t = Temp::new();
         let source = t.repo();
         let store = t.0.join("registry");
@@ -3029,9 +3526,11 @@ mod tests {
         assert_eq!(status(&store, &w).unwrap()["files"], json!([]));
         fs::write(t.0.join("outside"), "secret").unwrap();
         std::os::unix::fs::symlink(t.0.join("outside"), source.join("escaping-link")).unwrap();
+        text(&source, &["add", "escaping-link"]).unwrap();
         assert!(create(&store, &source, "unsafe", None, None)
             .unwrap_err()
-            .contains("External symlink"));
+            .to_lowercase()
+            .contains("external symlink"));
     }
     #[test]
     fn complete_large_delta_and_frozen_ignored_files() {
