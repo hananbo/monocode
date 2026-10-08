@@ -50,7 +50,9 @@ rules.
 Creation checks tracked and nonignored repository content for concurrent edits.
 Ignored runtime logs and caches are captured per file with native APFS clones;
 background writes and directory timestamp changes do not require the checkout
-to be idle. Git-ignored Unix sockets are omitted. A repository file, HEAD, file
+to be idle. Git-ignored Unix sockets and dangling runtime/dependency symlinks
+are omitted; missing link targets are not repaired. Permission errors and
+symlink cycles still fail explicitly. A repository file, HEAD, file
 list, or ref change still aborts creation with the relevant path or condition.
 
 Untracked and ignored external symlinks are materialized as private APFS copies

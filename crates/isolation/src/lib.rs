@@ -652,12 +652,9 @@ fn clone_tree_inner(
                 buffer.truncate(length as usize);
                 use std::os::unix::ffi::OsStringExt;
                 let link = PathBuf::from(std::ffi::OsString::from_vec(buffer));
-                let resolved = match canonical(&src.join(&link)) {
+                let resolved = match fs::canonicalize(src.join(&link)) {
                     Ok(path) => path,
-                    Err(_)
-                        if runtime
-                            && matches!(fs::symlink_metadata(entry.path()), Err(e) if e.kind() == std::io::ErrorKind::NotFound) =>
-                    {
+                    Err(error) if runtime && error.kind() == std::io::ErrorKind::NotFound => {
                         continue
                     }
                     Err(error) => {
@@ -2671,6 +2668,52 @@ mod tests {
     #[test]
     fn tracked_changes_still_refuse_isolation() {
         runtime_churn_fixture("tracked");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ignored_dangling_dependency_links_do_not_block_isolation() {
+        use std::os::unix::fs::symlink;
+        let t = Temp::new();
+        let source = t.repo();
+        if !native_supported(&source) {
+            return;
+        }
+        fs::write(source.join(".gitignore"), "deps/\nnode_modules/\n").unwrap();
+        text(&source, &["add", ".gitignore"]).unwrap();
+        text(&source, &["commit", "-m", "ignore dependencies"]).unwrap();
+        let modules = source.join("node_modules/@ast2llm/core/node_modules");
+        fs::create_dir_all(&modules).unwrap();
+        let link = "../../../node_modules/.pnpm/ts-morph@25.0.1/node_modules/ts-morph";
+        symlink(link, modules.join("ts-morph")).unwrap();
+        fs::write(modules.join("present.js"), "dependency\n").unwrap();
+        fs::create_dir(source.join("deps")).unwrap();
+        symlink(t.0.join("missing-external"), source.join("deps/missing")).unwrap();
+        let store = t.0.join("registry");
+        private_dir(&store).unwrap();
+        let w = create(&store, &source, "dangling-dependencies", None, None).unwrap();
+        let copy = Path::new(&w.path);
+        assert!(fs::symlink_metadata(
+            copy.join("node_modules/@ast2llm/core/node_modules/ts-morph")
+        )
+        .is_err());
+        assert!(fs::symlink_metadata(copy.join("deps/missing")).is_err());
+        assert_eq!(
+            fs::read(copy.join("node_modules/@ast2llm/core/node_modules/present.js")).unwrap(),
+            b"dependency\n"
+        );
+        assert_eq!(status(&store, &w).unwrap()["files"], json!([]));
+        assert_eq!(
+            fs::read_link(modules.join("ts-morph")).unwrap(),
+            PathBuf::from(link)
+        );
+        assert_eq!(text(&source, &["status", "--porcelain"]).unwrap(), "");
+        remove(&store, &w, false).unwrap();
+        assert!(!copy.exists());
+        symlink("missing", source.join("untracked-link")).unwrap();
+        assert!(create(&store, &source, "untracked-dangling", None, None).is_err());
+        fs::remove_file(source.join("untracked-link")).unwrap();
+        symlink("cycle", source.join("deps/cycle")).unwrap();
+        assert!(create(&store, &source, "ignored-cycle", None, None).is_err());
     }
     #[cfg(unix)]
     #[test]
