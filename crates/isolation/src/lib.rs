@@ -340,6 +340,22 @@ fn paths(root: &Path) -> Result<BTreeSet<String>> {
     }
     Ok(out)
 }
+#[cfg(unix)]
+fn ignored_socket(root: &Path, path: &Path) -> Result<bool> {
+    let relative = path.strip_prefix(root).map_err(err)?;
+    // Runtime sockets cannot be cloned or used by the isolated process. Respect
+    // Git's index: an ignored pattern must never hide a tracked file replacement.
+    let output = git_base(root)
+        .args(["check-ignore", "--quiet", "--"])
+        .arg(relative)
+        .output()
+        .map_err(err)?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(String::from_utf8_lossy(&output.stderr).to_string()),
+    }
+}
 fn validate_repo(root: &Path) -> Result<()> {
     text(root, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     if !git(root, &["ls-files", "-u"], None)?.is_empty() {
@@ -470,6 +486,9 @@ fn clone_tree(source: &Path, dest: &Path, exclude_git: bool) -> Result<()> {
             }
             let target = dst.join(&name);
             let kind = stat.st_mode & libc::S_IFMT;
+            if kind == libc::S_IFSOCK && exclude_git && ignored_socket(root, &entry.path())? {
+                continue;
+            }
             if kind == libc::S_IFLNK {
                 let mut buffer = vec![0u8; 65536];
                 let length = unsafe {
@@ -1107,7 +1126,7 @@ struct Fingerprint {
 }
 #[cfg(unix)]
 fn fingerprint(root: &Path) -> Result<BTreeMap<String, Fingerprint>> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     fn walk(root: &Path, p: &Path, out: &mut BTreeMap<String, Fingerprint>) -> Result<()> {
         let dir = open_dir(p)?;
         let directory_identity = (
@@ -1147,7 +1166,10 @@ fn fingerprint(root: &Path) -> Result<BTreeMap<String, Fingerprint>> {
                 m = opened;
                 None
             } else {
-                return Err("Unsupported special file".into());
+                if m.file_type().is_socket() && ignored_socket(root, &path)? {
+                    continue;
+                }
+                return Err(format!("Unsupported special file: {rel}"));
             };
             out.insert(
                 rel,
@@ -2256,6 +2278,65 @@ mod tests {
         .contains("APFS on macOS"));
         assert!(!source.with_file_name("project-cow").exists());
         assert_eq!(text(&source, &["status", "--porcelain"]).unwrap(), "");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ignored_runtime_sockets_do_not_block_isolation() {
+        use std::os::unix::net::UnixListener;
+        let t = Temp(PathBuf::from("/tmp").join(format!("cow-{}", uuid::Uuid::new_v4())));
+        private_dir(&t.0).unwrap();
+        let source = t.repo();
+        if !native_supported(&source) {
+            return;
+        }
+        // Use a short socket path: macOS limits Unix socket addresses to 104 bytes.
+        fs::write(source.join(".gitignore"), "deps/\napp.txt\n").unwrap();
+        text(&source, &["add", ".gitignore"]).unwrap();
+        text(&source, &["commit", "-m", "ignore runtime files"]).unwrap();
+        fs::create_dir(source.join("deps")).unwrap();
+        fs::write(source.join("deps/cache"), "keep ignored regular files").unwrap();
+        let socket = UnixListener::bind(source.join("deps/s")).unwrap();
+        let store = t.0.join("registry");
+        private_dir(&store).unwrap();
+        let w = create(&store, &source, "socket-session", None, None).unwrap();
+        let copy = Path::new(&w.path);
+        assert!(!copy.join("deps/s").exists());
+        assert_eq!(
+            fs::read(copy.join("deps/cache")).unwrap(),
+            b"keep ignored regular files"
+        );
+        assert!(status(&store, &w).is_ok());
+        remove(&store, &w, false).unwrap();
+        assert!(!copy.exists());
+        assert!(source.join("deps/s").exists());
+        assert!(socket.local_addr().is_ok());
+
+        let unignored = UnixListener::bind(source.join("s")).unwrap();
+        assert!(create(&store, &source, "unignored", None, None)
+            .unwrap_err()
+            .contains("Unsupported special file"));
+        drop(unignored);
+        fs::remove_file(source.join("s")).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = source.join("deps/fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert!(create(&store, &source, "fifo", None, None)
+            .unwrap_err()
+            .contains("Unsupported special file"));
+        fs::remove_file(fifo).unwrap();
+        let object_socket = UnixListener::bind(source.join(".git/objects/s")).unwrap();
+        assert!(create(&store, &source, "git-object", None, None)
+            .unwrap_err()
+            .contains("Unsupported special file"));
+        drop(object_socket);
+        fs::remove_file(source.join(".git/objects/s")).unwrap();
+        fs::remove_file(source.join("app.txt")).unwrap();
+        let tracked = UnixListener::bind(source.join("app.txt")).unwrap();
+        assert!(create(&store, &source, "tracked", None, None)
+            .unwrap_err()
+            .contains("Unsupported special file"));
+        drop(tracked);
     }
     #[test]
     fn public_metadata_is_compact_owned_and_independent_of_the_mutation_lock() {
