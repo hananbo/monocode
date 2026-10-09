@@ -523,7 +523,10 @@ it("uses ordinary Git commands and preserves local history on clone removal", as
       relative: "session.txt",
       contents: "session\n",
     });
-    await run("git_commit", { message: "session change", amend: false });
+    expect(await run("git_locate_files", { paths: [join(copy.path, "session.txt")] })).toEqual([
+      { root: copy.path, relative: "session.txt" },
+    ]);
+    await run("git_commit", { message: "session change", amend: false, paths: ["session.txt"] });
     expect(readFileSync(join(copy.path, "file.txt"), "utf8")).toBe(
       "inherited\n",
     );

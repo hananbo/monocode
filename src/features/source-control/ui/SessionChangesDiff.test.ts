@@ -100,7 +100,7 @@ it.each(["/repo-worktrees/feature", "/repo-cow/session"])(
     await act(async () =>
       container
         .querySelector<HTMLButtonElement>(
-          'button[title="Keep all session changes and dismiss this card"]',
+          'button[title="Keep the recorded changes and dismiss this card"]',
         )!
         .click(),
     );
