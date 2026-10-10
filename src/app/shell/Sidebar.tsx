@@ -191,7 +191,11 @@ import { MonoRailMascot } from "../../features/monos/ui/MonoRailMascot";
 import { useRailMonosPinned } from "../../features/settings/model/displayPrefs";
 import type { PickerMonos } from "../../features/projects/ui/SearchableProjectPicker";
 import { isHabitRun } from "../../features/monos/model/monoHabits";
-import type { MonoRailProps } from "./MonoRailSection";
+import {
+  unreadBadge,
+  unreadLabel,
+  type MonoRailProps,
+} from "./MonoRailSection";
 import {
   refreshRemoteProjectSessions,
   remoteRequest,
@@ -2616,8 +2620,9 @@ function CompactProjectRail({
                   status={mono.status}
                   active={mono.id === monos.activeId}
                   unseen={
-                    mono.id !== monos.activeId &&
-                    !!monos.unseenIds?.has(mono.id)
+                    mono.id === monos.activeId
+                      ? 0
+                      : (monos.unseenCounts?.get(mono.id) ?? 0)
                   }
                   onClick={() => monos.onOpen(mono.id)}
                 />
@@ -2734,7 +2739,8 @@ function CompactRailMono({
   color: string;
   status: MonoStatus;
   active: boolean;
-  unseen: boolean;
+  /** Replies the user has not read. */
+  unseen: number;
   onClick: () => void;
 }) {
   const label = `${name}, ${MONO_STATUS_LABEL[status]}`;
@@ -2742,7 +2748,7 @@ function CompactRailMono({
     <button
       type="button"
       title={`${name}\n${MONO_STATUS_LABEL[status]}`}
-      aria-label={unseen ? `${label}, new` : label}
+      aria-label={unseen ? `${label}, ${unreadLabel(unseen)}` : label}
       aria-current={active ? "true" : undefined}
       data-compact-rail-mono
       onClick={onClick}
@@ -2756,8 +2762,11 @@ function CompactRailMono({
       {unseen ? (
         <span
           aria-hidden
-          className="absolute bottom-1 left-1/2 size-1 -translate-x-1/2 rounded-full bg-content/60"
-        />
+          data-mono-unread={unseen}
+          className="absolute -right-0.5 -top-0.5 grid h-3.5 min-w-3.5 place-items-center rounded-full bg-background-base px-0.5 text-[9px] font-medium tabular-nums leading-none text-content/80 ring-1 ring-content/15"
+        >
+          {unreadBadge(unseen)}
+        </span>
       ) : null}
     </button>
   );
